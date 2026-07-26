@@ -1,0 +1,28 @@
+{
+  // Dogfood: named terminal profiles for preymax's own development.
+  // Copy this pattern into your own projects — see docs/vscode.md.
+  "terminal.integrated.profiles.osx": {
+    "daemon": {
+      "path": "/bin/zsh",
+      "args": ["-l"],
+      "env": { "PREYMAX_NAME": "daemon" },
+      "icon": "server-process",
+      "color": "terminal.ansiCyan"
+    },
+    "tests": {
+      "path": "/bin/zsh",
+      "args": ["-l"],
+      "env": { "PREYMAX_NAME": "tests" },
+      "icon": "beaker",
+      "color": "terminal.ansiGreen"
+    },
+    "docs": {
+      "path": "/bin/zsh",
+      "args": ["-l"],
+      "env": { "PREYMAX_NAME": "docs" },
+      "icon": "book",
+      "color": "terminal.ansiYellow"
+    }
+  },
+  "typescript.tsdk": "node_modules/typescript/lib"
+}

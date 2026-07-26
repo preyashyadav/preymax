@@ -1,0 +1,125 @@
+import { randomBytes } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { paths } from './paths.js';
+
+export interface Config {
+  /** Loopback port the daemon binds. */
+  port: number;
+  /**
+   * Also bind the Tailscale interface address so the phone can reach us.
+   * Never 0.0.0.0 — the daemon refuses to start if it resolves to one.
+   */
+  bindTailnet: boolean;
+  /**
+   * Base URL the phone uses to reach the daemon, e.g. https://mac.tail1234.ts.net:7717
+   * Required for action buttons; without it notifications are read-only.
+   */
+  publicBaseUrl: string | null;
+  /** Shared secret for HMAC-signing approvals. Generated on `preymax init`. */
+  secret: string;
+  /** How long the hook blocks waiting for a decision before returning `ask`. */
+  decisionTimeoutMs: number;
+  /** Hard cap on waiting for the model summary before sending the notification. */
+  summaryBudgetMs: number;
+  /** Suppress a duplicate push for the same fingerprint within this window. */
+  dedupeWindowMs: number;
+  /** Two or more escalations for one session inside this window become a digest. */
+  burstWindowMs: number;
+  /** Single-use approval nonce lifetime. */
+  nonceTtlMs: number;
+  /** Default lifetime of an "allow this pattern for a while" grant. */
+  grantTtlMs: number;
+  notify: {
+    /** 'ntfy' | 'none'. 'none' disables push entirely (Phase 1/2 operation). */
+    transport: 'ntfy' | 'none';
+    ntfy: {
+      server: string;
+      /** High-entropy topic. Anyone who knows it can read your notifications. */
+      topic: string;
+      /** Optional bearer token for a protected/self-hosted ntfy. */
+      token: string | null;
+      priority: number;
+      sound: string | null;
+    };
+  };
+  summarize: {
+    enabled: boolean;
+    model: string;
+    /** Read from ANTHROPIC_API_KEY if null. Never written to disk by init. */
+    apiKey: string | null;
+  };
+  /** Run the daemon under `caffeinate -dis` so the Mac stays reachable. */
+  caffeinate: boolean;
+}
+
+export const DEFAULT_CONFIG: Config = {
+  port: 7717,
+  bindTailnet: true,
+  publicBaseUrl: null,
+  secret: '',
+  decisionTimeoutMs: 60_000,
+  summaryBudgetMs: 800,
+  dedupeWindowMs: 30_000,
+  burstWindowMs: 5_000,
+  nonceTtlMs: 5 * 60_000,
+  grantTtlMs: 30 * 60_000,
+  notify: {
+    transport: 'ntfy',
+    ntfy: {
+      server: 'https://ntfy.sh',
+      topic: '',
+      token: null,
+      priority: 5,
+      sound: null,
+    },
+  },
+  summarize: {
+    enabled: true,
+    model: 'claude-haiku-4-5',
+    apiKey: null,
+  },
+  caffeinate: true,
+};
+
+function deepMerge<T>(base: T, patch: unknown): T {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    return (patch === undefined ? base : (patch as T));
+  }
+  const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+    const b = (base as Record<string, unknown>)[k];
+    out[k] = b && typeof b === 'object' && !Array.isArray(b) ? deepMerge(b, v) : v;
+  }
+  return out as T;
+}
+
+export function loadConfig(): Config {
+  const file = paths.config();
+  if (!existsSync(file)) return { ...DEFAULT_CONFIG };
+  try {
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(readFileSync(file, 'utf8')));
+  } catch (err) {
+    throw new Error(`config at ${file} is not valid JSON: ${(err as Error).message}`);
+  }
+}
+
+export function saveConfig(cfg: Config): void {
+  mkdirSync(paths.home(), { recursive: true });
+  writeFileSync(paths.config(), JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  // The secret lives here. Make the tightening explicit rather than relying on
+  // the writeFileSync mode, which is masked by umask on an existing file.
+  chmodSync(paths.config(), 0o600);
+}
+
+export function generateSecret(): string {
+  return randomBytes(32).toString('hex');
+}
+
+/** High-entropy ntfy topic. Guessing this is the only access control ntfy.sh offers. */
+export function generateTopic(): string {
+  return 'preymax-' + randomBytes(16).toString('base64url');
+}
+
+export function resolveApiKey(cfg: Config): string | null {
+  return cfg.summarize.apiKey || process.env.ANTHROPIC_API_KEY || null;
+}
