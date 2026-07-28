@@ -1,6 +1,12 @@
 {
+  // Default name for EVERY terminal in this project, including ones opened
+  // with the plain `+`. Without this, an un-profiled terminal falls back to
+  // basename(cwd)+branch and you can't tell it apart from any other session.
+  "terminal.integrated.env.osx": { "PREYMAX_NAME": "preymax" },
+
   // Dogfood: named terminal profiles for preymax's own development.
-  // Copy this pattern into your own projects — see docs/vscode.md.
+  // These override the default above. Copy this pattern into your own
+  // projects — see docs/vscode.md.
   "terminal.integrated.profiles.osx": {
     "daemon": {
       "path": "/bin/zsh",
