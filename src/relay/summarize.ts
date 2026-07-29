@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { Config } from './config.js';
-import { resolveApiKey } from './config.js';
+import type { Config } from '../core/config.js';
+import { resolveApiKey } from '../core/config.js';
 
 /**
  * One-sentence spoken-word summaries via Claude Haiku.

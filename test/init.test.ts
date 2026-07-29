@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildHookEntry, mergeHook, removeHook } from '../src/commands/init.js';
-import { GrantStore, grantPatternFor } from '../src/core/grants.js';
+import { GrantStore, grantPatternFor } from '../src/relay/grants.js';
 import { templateSummary, notificationBody } from '../src/core/template.js';
 import { resolveIdentity } from '../src/core/identity.js';
 import type { PreToolUsePayload } from '../src/types.js';

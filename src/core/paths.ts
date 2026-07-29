@@ -10,6 +10,13 @@ export const paths = {
   home: preymaxHome,
   config: () => join(preymaxHome(), 'config.json'),
   policy: () => join(preymaxHome(), 'policy.yaml'),
+  /** Directory of daily JSONL files: events/YYYY-MM-DD.jsonl */
+  logDir: () => join(preymaxHome(), 'events'),
+  /**
+   * v1's single append-only log. Still read by `stats` and `suggest` so the
+   * history collected before the daily split is not orphaned; never written.
+   */
+  legacyEvents: () => join(preymaxHome(), 'events.jsonl'),
   events: () => join(preymaxHome(), 'events.jsonl'),
   pending: () => join(preymaxHome(), 'pending.json'),
   grants: () => join(preymaxHome(), 'grants.json'),

@@ -37,7 +37,7 @@ export interface DaemonStatus {
   bind: { addresses: string[]; tailnet: string | null; port: number };
   configPath: string;
   configDirs: ConfigDirStatus[];
-  policy: { path: string; allowRules: number; denyRules: number; error?: string };
+  policy: { path: string; allowRules: number; error?: string };
   log: { path: string; writable: boolean; error?: string };
   summarizer: {
     enabled: boolean;
@@ -92,8 +92,16 @@ function writable(file: string): { writable: boolean; error?: string } {
 
 /** Why the summarizer is or is not usable, phrased for a human reading doctor. */
 function summarizerReason(cfg: Config, available: boolean): string {
-  if (!cfg.summarize.enabled) return 'disabled in config — template summaries only';
   if (available) return 'ready';
+  // Check this first: with the relay off the summarizer is not merely
+  // unavailable, it is never constructed. Reporting a missing API key here
+  // would send the user to fix something that is not the reason.
+  if (!cfg.relay.enabled || cfg.shadow) {
+    return cfg.shadow
+      ? 'not running — shadow mode is on, so nothing is summarized or sent'
+      : 'not running — the relay is off, so no summary is needed';
+  }
+  if (!cfg.summarize.enabled) return 'disabled in config — template summaries only';
   if (!resolveApiKey(cfg)) {
     return (
       'no API key visible to the daemon. The daemon runs under launchd and does ' +
@@ -109,12 +117,9 @@ export function buildStatus(input: StatusInputs): DaemonStatus {
   const { cfg } = input;
 
   let allowRules = 0;
-  let denyRules = 0;
   let policyError: string | undefined;
   try {
-    const p = loadPolicy();
-    allowRules = p.auto_allow.length;
-    denyRules = p.auto_deny.length;
+    allowRules = loadPolicy().auto_allow.length;
   } catch (err) {
     policyError = (err as Error).message;
   }
@@ -132,7 +137,6 @@ export function buildStatus(input: StatusInputs): DaemonStatus {
     policy: {
       path: paths.policy(),
       allowRules,
-      denyRules,
       ...(policyError ? { error: policyError } : {}),
     },
     log: { path: paths.events(), ...log },

@@ -3,7 +3,6 @@ import { statSync } from 'node:fs';
 import { loadConfig } from '../core/config.js';
 import { LAUNCHD_LABEL, paths } from '../core/paths.js';
 import type { DaemonStatus } from '../daemon/status.js';
-import { publish } from '../notify/ntfy.js';
 import { fetchStatus } from './client.js';
 
 const GREEN = '\x1b[32m';
@@ -155,7 +154,7 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
       : {
           name: 'policy',
           status: 'ok',
-          detail: `${status.policy.allowRules} allow / ${status.policy.denyRules} deny rules`,
+          detail: `${status.policy.allowRules} allow rules`,
         },
   );
 
@@ -242,9 +241,11 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
         }
       : {
           name: 'summaries',
-          status: 'warn',
+          // Not running because the relay is off is the expected v2 default,
+          // not a fault. Only a genuinely broken summarizer warrants a warning.
+          status: status.summarizer.reason.startsWith('not running') ? 'ok' : 'warn',
           detail: status.summarizer.reason,
-          ...(status.summarizer.enabled
+          ...(status.summarizer.reason.includes('API key')
             ? { fix: 'preymax init   (writes the key where the daemon can see it)' }
             : {}),
         },
@@ -265,6 +266,9 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
   } else if (!cfg.notify.ntfy.topic) {
     checks.push({ name: 'push', status: 'fail', detail: 'no ntfy topic', fix: 'preymax init' });
   } else if (opts.push) {
+    // Lazily imported: the transport belongs to the relay, and doctor must be
+    // runnable — and useful — on an install where the relay is off.
+    const { publish } = await import('../relay/transports/ntfy.js');
     const result = await publish(cfg, {
       topic: cfg.notify.ntfy.topic,
       title: 'preymax doctor',

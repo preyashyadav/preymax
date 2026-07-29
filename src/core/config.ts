@@ -36,6 +36,23 @@ export interface Config {
   nonceTtlMs: number;
   /** Default lifetime of an "allow this pattern for a while" grant. */
   grantTtlMs: number;
+  /**
+   * Shadow mode: log every escalation, decide nothing, notify nobody, and
+   * return `ask` immediately so no terminal ever stalls. This is the mode you
+   * measure in. v1 required faking it with `transport: none` +
+   * `decisionTimeoutMs: 1`, which was easy to set wrong and easy to forget to
+   * revert (handoff bug 4). Toggle with `preymax shadow on|off`.
+   */
+  shadow: boolean;
+  relay: {
+    /**
+     * The single gate for the entire notification/approval subsystem. When
+     * false, `src/relay/**` is never imported — so no summarizer is
+     * constructed, no transport is loaded, and the hook path cannot perform
+     * network I/O even by mistake. Structure, not discipline (PLANv2 §4).
+     */
+    enabled: boolean;
+  };
   notify: {
     /** 'ntfy' | 'none'. 'none' disables push entirely (Phase 1/2 operation). */
     transport: 'ntfy' | 'none';
@@ -71,6 +88,10 @@ export const DEFAULT_CONFIG: Config = {
   burstWindowMs: 5_000,
   nonceTtlMs: 5 * 60_000,
   grantTtlMs: 30 * 60_000,
+  // v2 default: local-only. The relay is opt-in and has never been validated
+  // against a real device (PLANv2 §6).
+  shadow: false,
+  relay: { enabled: false },
   notify: {
     transport: 'ntfy',
     ntfy: {
@@ -104,11 +125,35 @@ function deepMerge<T>(base: T, patch: unknown): T {
 export function loadConfig(): Config {
   const file = paths.config();
   if (!existsSync(file)) return { ...DEFAULT_CONFIG };
+  let raw: Record<string, unknown>;
   try {
-    return deepMerge(DEFAULT_CONFIG, JSON.parse(readFileSync(file, 'utf8')));
+    raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
   } catch (err) {
     throw new Error(`config at ${file} is not valid JSON: ${(err as Error).message}`);
   }
+  return migrate(deepMerge(DEFAULT_CONFIG, raw), raw);
+}
+
+/**
+ * Map a v1 config onto v2's `shadow` / `relay` fields.
+ *
+ * v1 had no way to say "observe but do not act", so shadow mode was faked with
+ * `notify.transport: "none"` plus a sub-second `decisionTimeoutMs`. That exact
+ * pair is recognised here and becomes `shadow: true`, so an existing install
+ * keeps behaving identically without the user editing anything.
+ */
+function migrate(cfg: Config, raw: Record<string, unknown>): Config {
+  const notify = raw.notify as { transport?: string } | undefined;
+  const transportOff = notify?.transport === 'none';
+
+  if (raw.relay === undefined) {
+    cfg.relay = { ...cfg.relay, enabled: notify?.transport !== undefined && !transportOff };
+  }
+  if (raw.shadow === undefined) {
+    const timeout = typeof raw.decisionTimeoutMs === 'number' ? raw.decisionTimeoutMs : 60_000;
+    cfg.shadow = transportOff && timeout <= 1_000;
+  }
+  return cfg;
 }
 
 export function saveConfig(cfg: Config): void {

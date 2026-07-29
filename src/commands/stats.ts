@@ -1,4 +1,4 @@
-import { readEvents } from '../core/log.js';
+import { readEvents } from '../log/events.js';
 import { colorFor } from '../core/identity.js';
 import type { EventRecord } from '../types.js';
 

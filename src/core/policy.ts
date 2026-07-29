@@ -4,10 +4,20 @@ import { paths } from './paths.js';
 
 /**
  * The policy engine exists to cut escalation volume, not to provide security.
- * A `deny` here stops a tool call, but preymax is not a sandbox and must never
- * be described as one. See README, "Not a security product".
+ * preymax is not a sandbox and must never be described as one. See README,
+ * "Not a security product".
  *
- * Design principle from the plan: push everything you can into Claude Code's
+ * **There is no deny bucket.** v1 had one; in 48h of real use it fired once,
+ * and that once was a false positive on a legitimate `rm -rf` of a temp
+ * directory, with no override short of editing the policy file. Claude Code's
+ * native `permissions.deny` already does this properly and is a real boundary.
+ * Duplicating it here bought nothing and inherited a failure mode, so v2
+ * removes it (PLANv2 §3).
+ *
+ * Consequence for rule authors: an allow rule must be safe *on its own*. It can
+ * no longer assume a deny rule will catch the tail of a chained command.
+ *
+ * Design principle carried forward: push everything you can into Claude Code's
  * native `permissions.allow` so it never reaches preymax at all. If this engine
  * is deciding on Read calls, the configuration is wrong.
  */
@@ -25,45 +35,41 @@ export interface Rule {
 
 export interface Policy {
   auto_allow: Rule[];
-  auto_deny: Rule[];
 }
 
 export interface PolicyMatch {
-  bucket: 'auto_allow' | 'auto_deny' | 'escalate';
+  bucket: 'auto_allow' | 'escalate';
   rule?: Rule;
   reason?: string;
 }
 
 export const DEFAULT_POLICY_YAML = `# preymax policy
 #
-# Three buckets, evaluated in order: auto_deny, then auto_allow, then escalate.
-# auto_deny wins ties on purpose — a command that matches both is denied.
+# Two outcomes: auto_allow, or escalate. Anything not matched below escalates.
 #
-# This layer reduces noise. It is NOT a security boundary: a determined command
-# can evade any regex here. Put real guarantees in Claude Code's native
-# permissions.deny, and prefer native permissions.allow for the obvious reads so
-# they never reach preymax at all.
-
-auto_deny:
-  - tool: Bash
-    command_matches:
-      - '\\brm\\b.*(-rf|-fr|-r\\s+-f)'
-      - 'git\\s+push\\b.*--force(-with-lease)?\\b.*\\b(main|master|prod|production)\\b'
-      - '>\\s*\\.env'
-      - '--no-verify'
-      - '\\bcurl\\b[^|]*\\|\\s*(sudo\\s+)?(ba|z|)sh'
-      - '\\bchmod\\b\\s+(-R\\s+)?777'
-    reason: "destructive pattern — blocked by preymax policy"
+# There is deliberately NO deny bucket. preymax is not a security boundary and
+# a determined command evades any regex here. Real guarantees belong in Claude
+# Code's native permissions.deny; obvious reads belong in its permissions.allow
+# so they never reach preymax at all.
+#
+# Because nothing catches the tail of a command, every rule below must be safe
+# on its own. Anchor with ^...$ and exclude shell metacharacters rather than
+# matching a bare prefix — a bare '^cd\\s' would allow 'cd x && anything'.
 
 auto_allow:
-  - tool: [Read, Glob, Grep, NotebookRead, TodoWrite]
+  - tool: [Read, Glob, Grep, NotebookRead, TodoWrite, AskUserQuestion]
   - tool: Bash
     command_matches:
-      - '^git\\s+(status|diff|log|branch|show|remote|stash list)\\b'
-      - '^npm\\s+(test|run\\s+(lint|test|typecheck|build))\\b'
-      - '^(ls|cat|pwd|head|tail|wc|which|echo)\\b'
-      - '^(node|python3?)\\s+--version\\b'
-      - '^jq\\b'
+      # Every rule ends with [^;&|><$\`\\n]*$ — no chaining, no redirection, no
+      # substitution. Without it, '^echo\\b' allows 'echo SECRET=x > .env', which
+      # is a write. v1 got away with prefix rules only because a deny bucket
+      # caught the tail; there is no such backstop now.
+      - '^cd\\s+[^;&|><$\`\\n]+$'
+      - '^git\\s+(status|diff|log|branch|show|remote|stash list)\\b[^;&|><$\`\\n]*$'
+      - '^npm\\s+(test|run\\s+(lint|test|typecheck|build))\\b[^;&|><$\`\\n]*$'
+      - '^(ls|cat|pwd|head|tail|wc|which|echo)\\b[^;&|><$\`\\n]*$'
+      - '^(node|python3?)\\s+--version\\b[^;&|><$\`\\n]*$'
+      - '^jq\\b[^;&|><$\`\\n]*$'
 
 # Everything not matched above escalates.
 `;
@@ -91,19 +97,26 @@ export function parsePolicy(yaml: string, source = '<inline>'): Policy {
     throw new Error(`policy at ${source} is not valid YAML: ${(err as Error).message}`);
   }
   const obj = (raw ?? {}) as Record<string, unknown>;
+  if (obj.auto_deny != null) {
+    // Loud rather than silent: a v1 policy carrying deny rules would otherwise
+    // look like it still blocked things while quietly allowing every one.
+    console.warn(
+      'preymax: `auto_deny` in the policy file is ignored — v2 removed the deny ' +
+        "bucket (PLANv2 §3). Move real blocks to Claude Code's permissions.deny.",
+    );
+  }
   const policy: Policy = {
     auto_allow: coerceRules(obj.auto_allow, `${source}:auto_allow`),
-    auto_deny: coerceRules(obj.auto_deny, `${source}:auto_deny`),
   };
   // Fail loudly at load time rather than silently never matching at 3am.
-  for (const bucket of ['auto_allow', 'auto_deny'] as const) {
-    for (const rule of policy[bucket]) {
-      for (const p of [...(rule.command_matches ?? []), ...(rule.path_matches ?? [])]) {
-        try {
-          new RegExp(p);
-        } catch (err) {
-          throw new Error(`policy ${bucket}: invalid regex ${JSON.stringify(p)} — ${(err as Error).message}`);
-        }
+  for (const rule of policy.auto_allow) {
+    for (const p of [...(rule.command_matches ?? []), ...(rule.path_matches ?? [])]) {
+      try {
+        new RegExp(p);
+      } catch (err) {
+        throw new Error(
+          `policy auto_allow: invalid regex ${JSON.stringify(p)} — ${(err as Error).message}`,
+        );
       }
     }
   }
@@ -168,23 +181,14 @@ function ruleMatches(rule: Rule, toolName: string, input: Record<string, unknown
 }
 
 /**
- * Evaluate a tool call. auto_deny is checked first so a command that matches
- * both buckets is denied rather than allowed.
+ * Evaluate a tool call: allow it, or escalate it. Pure and synchronous — this
+ * runs on the hook hot path, which performs no I/O of any kind.
  */
 export function evaluate(
   policy: Policy,
   toolName: string,
   input: Record<string, unknown>,
 ): PolicyMatch {
-  for (const rule of policy.auto_deny) {
-    if (ruleMatches(rule, toolName, input)) {
-      return {
-        bucket: 'auto_deny',
-        rule,
-        reason: rule.reason ?? 'blocked by preymax policy',
-      };
-    }
-  }
   for (const rule of policy.auto_allow) {
     if (ruleMatches(rule, toolName, input)) {
       return { bucket: 'auto_allow', rule };

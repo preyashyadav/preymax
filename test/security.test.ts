@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeApproval, sign, verify, newNonce } from '../src/core/hmac.js';
-import { PendingStore } from '../src/daemon/pending.js';
+import { PendingStore } from '../src/relay/pending.js';
 import { assertSafeBind, isTailscaleAddress, UnsafeBindError } from '../src/daemon/net.js';
 import type { SessionIdentity } from '../src/types.js';
 

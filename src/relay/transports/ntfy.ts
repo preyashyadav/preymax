@@ -1,7 +1,7 @@
-import type { Config } from '../core/config.js';
-import { makeApproval } from '../core/hmac.js';
-import type { PendingRequest } from '../types.js';
-import { notificationBody } from '../core/template.js';
+import type { Config } from '../../core/config.js';
+import { makeApproval } from '../../core/hmac.js';
+import type { PendingRequest } from '../../types.js';
+import { notificationBody } from '../../core/template.js';
 
 /**
  * Push transport: ntfy.

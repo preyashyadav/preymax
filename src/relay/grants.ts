@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { paths } from './paths.js';
+import { paths } from '../core/paths.js';
 
 /**
  * Temporary allow grants: "allow this pattern for 30 minutes".

@@ -27,6 +27,11 @@ writeFileSync(
     secret: SECRET,
     decisionTimeoutMs: 700,
     summaryBudgetMs: 1,
+    // The relay is off by default in v2. These tests exercise escalation,
+    // approval and grants, so they turn it on explicitly. Shadow must be off
+    // or the daemon short-circuits to `ask` without ever loading the relay.
+    shadow: false,
+    relay: { enabled: true },
     notify: { transport: 'none', ntfy: { server: '', topic: '', token: null, priority: 5, sound: null } },
     summarize: { enabled: false, model: 'claude-haiku-4-5', apiKey: null },
   }),
@@ -35,20 +40,17 @@ writeFileSync(
 writeFileSync(
   join(HOME, 'policy.yaml'),
   `
-auto_deny:
-  - tool: Bash
-    command_matches: ['\\brm\\b.*-rf']
-    reason: "destructive pattern — blocked by preymax policy"
 auto_allow:
   - tool: [Read, Glob]
   - tool: Bash
-    command_matches: ['^git status']
+    command_matches: ['^git status\\b[^;&|><]*$']
 `,
 );
 
 const { Daemon } = await import('../src/daemon/server.js');
 const { loadConfig } = await import('../src/core/config.js');
 const { makeApproval } = await import('../src/core/hmac.js');
+const { logFileFor } = await import('../src/log/events.js');
 
 const base = `http://127.0.0.1:${PORT}`;
 let handle: Awaited<ReturnType<InstanceType<typeof Daemon>['start']>>;
@@ -103,10 +105,12 @@ describe('daemon end-to-end', () => {
     assert.equal(out.hookSpecificOutput.permissionDecision, 'allow');
   });
 
-  it('auto-denies a destructive command and explains why', async () => {
+  // v2 has no deny bucket. A destructive command must escalate to a human —
+  // it must never come back as `allow`.
+  it('escalates a destructive command rather than allowing it', async () => {
     const out = await postHook('Bash', { command: 'rm -rf /important' });
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason ?? '', /preymax policy/);
+    assert.notEqual(out.hookSpecificOutput.permissionDecision, 'allow');
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'ask');
   });
 
   it('escalates an unmatched command and falls through to ask on timeout', async () => {
@@ -241,7 +245,9 @@ describe('daemon end-to-end', () => {
 
   it('writes a JSONL event log with latency and decision source', async () => {
     await postHook('Read', { file_path: '/tmp/logged.ts' });
-    const file = join(HOME, 'events.jsonl');
+    // v2 writes one file per day under events/; read through the same helper
+    // the product uses rather than reaching for a hardcoded filename.
+    const file = logFileFor();
     assert.ok(existsSync(file), 'no event log was written');
     const lines = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const allow = lines.find(
@@ -255,7 +261,7 @@ describe('daemon end-to-end', () => {
 
   it('resolves the terminal name from the X-Preymax-Name header', async () => {
     await postHook('Read', { file_path: '/tmp/named.ts' }, 'infra');
-    const lines = readFileSync(join(HOME, 'events.jsonl'), 'utf8')
+    const lines = readFileSync(logFileFor(), 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
@@ -271,7 +277,7 @@ describe('daemon end-to-end', () => {
       body: JSON.stringify(hookPayload('Read', { file_path: '/tmp/y.ts' })),
     });
     await res.json();
-    const lines = readFileSync(join(HOME, 'events.jsonl'), 'utf8')
+    const lines = readFileSync(logFileFor(), 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
