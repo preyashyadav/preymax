@@ -1,11 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { loadConfig, resolveApiKey } from '../core/config.js';
+import { statSync } from 'node:fs';
+import { loadConfig } from '../core/config.js';
 import { LAUNCHD_LABEL, paths } from '../core/paths.js';
-import { loadPolicy } from '../core/policy.js';
-import { findTailnetAddress } from '../daemon/net.js';
+import type { DaemonStatus } from '../daemon/status.js';
 import { publish } from '../notify/ntfy.js';
-import { fetchHealth } from './client.js';
+import { fetchStatus } from './client.js';
 
 const GREEN = '\x1b[32m';
 const RED = '\x1b[31m';
@@ -26,37 +25,51 @@ function mark(s: Status): string {
   return s === 'ok' ? `${GREEN}✓${RESET}` : s === 'warn' ? `${YELLOW}!${RESET}` : `${RED}✗${RESET}`;
 }
 
+/** Home-relative path, so a column of config dirs stays readable. */
+function short(p: string): string {
+  const home = process.env.HOME;
+  return home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+function humanUptime(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+}
+
 /**
- * `preymax doctor` — verify hook registration, daemon health, tailnet
- * reachability, and push delivery. Each check reports the fix, not just the
- * failure, because this is the command you run when something is already wrong.
+ * `preymax doctor` — verify the whole path end to end.
+ *
+ * **Everything the daemon can answer, the daemon answers.** doctor renders
+ * `GET /status` and computes nothing about hooks, policy, the log, the tailnet
+ * or the summarizer itself. v1 did compute them, in this process, reading this
+ * process's environment — and reported a green summarizer while the daemon
+ * under launchd had no API key at all (handoff bug 2). When the daemon is down
+ * those facts are reported as *unverified* rather than guessed at.
  */
 export async function runDoctor(opts: { push: boolean }): Promise<number> {
   const checks: Check[] = [];
   let cfg;
 
+  // --- Local facts: true regardless of whether the daemon is running. -------
+
   try {
     cfg = loadConfig();
     checks.push({ name: 'config', status: 'ok', detail: paths.config() });
   } catch (err) {
-    checks.push({
-      name: 'config',
-      status: 'fail',
-      detail: (err as Error).message,
-      fix: 'preymax init',
-    });
+    checks.push({ name: 'config', status: 'fail', detail: (err as Error).message, fix: 'preymax init' });
     report(checks);
     return 1;
   }
 
-  // Secret
   checks.push(
     cfg.secret
       ? { name: 'secret', status: 'ok', detail: 'present' }
-      : { name: 'secret', status: 'fail', detail: 'missing', fix: 'preymax init' }
+      : { name: 'secret', status: 'fail', detail: 'missing', fix: 'preymax init' },
   );
 
-  // Config file permissions — it holds the approval secret.
+  // The config file holds the approval secret and possibly the API key.
   try {
     const mode = statSync(paths.config()).mode & 0o777;
     checks.push(
@@ -73,111 +86,12 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
     /* covered by the config check above */
   }
 
-  // Policy
+  // launchd is about the agent, not the daemon's internal view, so it stays here.
   try {
-    const p = loadPolicy();
-    checks.push({
-      name: 'policy',
-      status: 'ok',
-      detail: `${p.auto_allow.length} allow / ${p.auto_deny.length} deny rules`,
+    const out = execFileSync('launchctl', ['list'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
-  } catch (err) {
-    checks.push({
-      name: 'policy',
-      status: 'fail',
-      detail: (err as Error).message,
-      fix: `edit ${paths.policy()}`,
-    });
-  }
-
-  // Hook registration
-  const settingsFile = paths.claudeSettings();
-  if (!existsSync(settingsFile)) {
-    checks.push({
-      name: 'hook',
-      status: 'fail',
-      detail: `${settingsFile} does not exist`,
-      fix: 'preymax init',
-    });
-  } else {
-    try {
-      const settings = JSON.parse(readFileSync(settingsFile, 'utf8')) as Record<string, unknown>;
-      const groups = (settings.hooks as Record<string, unknown> | undefined)?.PreToolUse;
-      const entries = Array.isArray(groups)
-        ? (groups as Array<{ hooks?: unknown[] }>).flatMap((g) => g.hooks ?? [])
-        : [];
-      const ours = entries.filter(
-        (h): h is { url: string; allowedEnvVars?: string[] } =>
-          !!h && typeof h === 'object' && typeof (h as { url?: unknown }).url === 'string' &&
-          (h as { url: string }).url.includes('/hook'),
-      );
-
-      if (ours.length === 0) {
-        checks.push({ name: 'hook', status: 'fail', detail: 'not registered', fix: 'preymax init' });
-      } else if (ours.length > 1) {
-        checks.push({
-          name: 'hook',
-          status: 'warn',
-          detail: `${ours.length} preymax hooks registered — every tool call fires all of them`,
-          fix: `remove the duplicates from ${settingsFile}`,
-        });
-      } else {
-        const entry = ours[0]!;
-        const portMatches = entry.url.includes(`:${cfg.port}/`);
-        const envAllowed = entry.allowedEnvVars?.includes('PREYMAX_NAME') ?? false;
-        checks.push({
-          name: 'hook',
-          status: portMatches ? 'ok' : 'warn',
-          detail: portMatches
-            ? entry.url
-            : `${entry.url} but config.port is ${cfg.port} — the hook points at nothing`,
-          ...(portMatches ? {} : { fix: 'preymax init' }),
-        });
-        checks.push(
-          envAllowed
-            ? { name: 'PREYMAX_NAME', status: 'ok', detail: 'allowlisted for header interpolation' }
-            : {
-                name: 'PREYMAX_NAME',
-                status: 'warn',
-                detail:
-                  'not in allowedEnvVars — $PREYMAX_NAME resolves to an empty string, silently, ' +
-                  'and every terminal falls back to cwd+branch naming',
-                fix: 'preymax init',
-              },
-        );
-      }
-    } catch (err) {
-      checks.push({
-        name: 'hook',
-        status: 'fail',
-        detail: `${settingsFile} is not valid JSON: ${(err as Error).message}`,
-        fix: 'fix the JSON by hand, then preymax init',
-      });
-    }
-  }
-
-  // Daemon
-  let daemonUp = false;
-  try {
-    const health = await fetchHealth();
-    daemonUp = true;
-    checks.push({
-      name: 'daemon',
-      status: 'ok',
-      detail: `up on 127.0.0.1:${cfg.port} · ${health.pending} pending · summarizer ${health.summarizer}`,
-    });
-  } catch (err) {
-    checks.push({
-      name: 'daemon',
-      status: 'fail',
-      detail: (err as Error).message.split('\n')[0]!,
-      fix: 'preymax daemon   (or: launchctl load -w ' + paths.launchAgent() + ')',
-    });
-  }
-
-  // launchd
-  try {
-    const out = execFileSync('launchctl', ['list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     const line = out.split('\n').find((l) => l.includes(LAUNCHD_LABEL));
     checks.push(
       line
@@ -193,51 +107,161 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
     checks.push({ name: 'launchd', status: 'warn', detail: 'launchctl unavailable' });
   }
 
-  // Tailnet
-  const tailnet = findTailnetAddress();
-  if (!cfg.bindTailnet) {
-    checks.push({ name: 'tailnet', status: 'warn', detail: 'disabled in config — loopback only' });
-  } else if (tailnet) {
-    checks.push({ name: 'tailnet', status: 'ok', detail: `bound ${tailnet}` });
-  } else {
+  // --- The daemon's own view. -----------------------------------------------
+
+  let status: DaemonStatus | null = null;
+  let daemonError = '';
+  try {
+    status = await fetchStatus();
+  } catch (err) {
+    daemonError = (err as Error).message.split('\n')[0]!;
+  }
+
+  if (!status) {
     checks.push({
-      name: 'tailnet',
+      name: 'daemon',
+      status: 'fail',
+      detail: daemonError,
+      fix: `preymax daemon   (or: launchctl load -w ${paths.launchAgent()})`,
+    });
+    checks.push({
+      name: 'unverified',
       status: 'warn',
-      detail: 'no Tailscale interface found — the phone cannot reach the daemon',
-      fix: 'install and start Tailscale, then restart the daemon',
+      detail:
+        'hook registration, policy, event log, tailnet and summarizer state all live in ' +
+        'the daemon and cannot be confirmed while it is down',
+    });
+    report(checks);
+    return 1;
+  }
+
+  checks.push({
+    name: 'daemon',
+    status: 'ok',
+    detail:
+      `up on ${status.bind.addresses.join(', ')}:${status.bind.port} · pid ${status.pid} · ` +
+      `up ${humanUptime(status.uptimeMs)} · ${status.pending} pending`,
+  });
+
+  // Policy
+  checks.push(
+    status.policy.error
+      ? {
+          name: 'policy',
+          status: 'fail',
+          detail: status.policy.error,
+          fix: `edit ${status.policy.path}`,
+        }
+      : {
+          name: 'policy',
+          status: 'ok',
+          detail: `${status.policy.allowRules} allow / ${status.policy.denyRules} deny rules`,
+        },
+  );
+
+  // Event log — if this is not writable, every measurement downstream is empty.
+  checks.push(
+    status.log.writable
+      ? { name: 'event log', status: 'ok', detail: status.log.path }
+      : {
+          name: 'event log',
+          status: 'fail',
+          detail: `not writable: ${status.log.error ?? 'unknown'} — nothing is being recorded`,
+          fix: `check permissions on ${status.log.path}`,
+        },
+  );
+
+  // Config directories, per directory.
+  const visible = status.configDirs.filter((d) => d.exists);
+  const hooked = visible.filter((d) => d.hooked && !d.error);
+  const unhooked = visible.filter((d) => !d.hooked || d.error);
+
+  checks.push(
+    visible.length === 0
+      ? { name: 'config dirs', status: 'fail', detail: 'no Claude config directory found', fix: 'preymax init' }
+      : {
+          name: 'config dirs',
+          status: hooked.length === 0 ? 'fail' : unhooked.length > 0 ? 'warn' : 'ok',
+          detail: `${hooked.length}/${visible.length} hooked`,
+          ...(unhooked.length > 0 ? { fix: 'preymax init' } : {}),
+        },
+  );
+
+  for (const d of visible) {
+    checks.push({
+      name: `  ${short(d.path)}`,
+      status: d.error ? 'fail' : d.hooked ? 'ok' : 'warn',
+      detail: d.error
+        ? `settings.json unreadable: ${d.error}`
+        : d.hooked
+          ? `hooked [${d.sources.join(',')}]`
+          : `no preymax hook — sessions using this account are invisible [${d.sources.join(',')}]`,
+      ...(d.hooked || d.error ? {} : { fix: 'preymax init' }),
     });
   }
 
-  // Public base URL / action buttons
+  for (const d of status.configDirs.filter((x) => x.warning)) {
+    checks.push({ name: `  ${short(d.path)}`, status: 'warn', detail: d.warning! });
+  }
+
+  // Tailnet — reported as the daemon actually bound it, not as this process sees it.
   checks.push(
-    cfg.publicBaseUrl
-      ? { name: 'approve URL', status: 'ok', detail: cfg.publicBaseUrl }
+    status.bind.tailnet
+      ? { name: 'tailnet', status: 'ok', detail: `bound ${status.bind.tailnet}` }
+      : {
+          name: 'tailnet',
+          status: 'warn',
+          detail: 'not bound — the phone cannot reach the daemon',
+          fix: 'install and start Tailscale, then restart the daemon',
+        },
+  );
+
+  // Approve URL / action buttons.
+  checks.push(
+    status.relay.publicBaseUrl
+      ? { name: 'approve URL', status: 'ok', detail: status.relay.publicBaseUrl }
       : {
           name: 'approve URL',
           status: 'warn',
           detail: 'not set — notifications have no action buttons (read-only)',
-          fix: 'preymax init --public-url https://<mac>.<tailnet>.ts.net:' + cfg.port,
+          // The daemon speaks plain HTTP; TLS is terminated by Tailscale Serve
+          // on 443, so the URL carries no port. See docs/ios-shortcuts.md.
+          fix:
+            `tailscale serve --bg --https=443 http://127.0.0.1:${status.bind.port}` +
+            '  then  preymax init --public-url https://<mac>.<tailnet>.ts.net',
         },
   );
 
-  // Summarizer
-  const apiKey = resolveApiKey(cfg);
-  if (!cfg.summarize.enabled) {
-    checks.push({ name: 'summaries', status: 'warn', detail: 'disabled — template summaries only' });
-  } else if (!apiKey) {
+  // Summarizer — the daemon's answer, in the daemon's environment.
+  checks.push(
+    status.summarizer.available
+      ? {
+          name: 'summaries',
+          status: 'ok',
+          detail: `${status.summarizer.model} · ${status.summarizer.stats.hits} cached, ${status.summarizer.stats.errors} errors`,
+        }
+      : {
+          name: 'summaries',
+          status: 'warn',
+          detail: status.summarizer.reason,
+          ...(status.summarizer.enabled
+            ? { fix: 'preymax init   (writes the key where the daemon can see it)' }
+            : {}),
+        },
+  );
+
+  // Shadow mode is a deliberate state, and doctor must not present it as broken.
+  if (status.relay.decisionTimeoutMs <= 1000 && !status.relay.enabled) {
     checks.push({
-      name: 'summaries',
-      status: 'warn',
-      detail: 'no ANTHROPIC_API_KEY — falling back to template summaries',
-      fix: 'export ANTHROPIC_API_KEY=…',
+      name: 'shadow mode',
+      status: 'ok',
+      detail: 'on — escalations are logged and fall straight through to the normal prompt',
     });
-  } else {
-    checks.push({ name: 'summaries', status: 'ok', detail: `${cfg.summarize.model} via API key` });
   }
 
-  // Push delivery
-  if (cfg.notify.transport === 'none') {
-    checks.push({ name: 'push', status: 'warn', detail: 'transport disabled' });
+  // Push delivery.
+  if (!status.relay.enabled) {
+    checks.push({ name: 'push', status: 'warn', detail: `transport ${status.relay.transport}` });
   } else if (!cfg.notify.ntfy.topic) {
     checks.push({ name: 'push', status: 'fail', detail: 'no ntfy topic', fix: 'preymax init' });
   } else if (opts.push) {
@@ -264,9 +288,7 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
   report(checks);
 
   const failed = checks.filter((c) => c.status === 'fail').length;
-  if (failed === 0 && daemonUp) {
-    console.log(`\n${GREEN}ready${RESET}`);
-  }
+  if (failed === 0) console.log(`\n${GREEN}ready${RESET}`);
   return failed > 0 ? 1 : 0;
 }
 

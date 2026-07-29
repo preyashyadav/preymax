@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -7,11 +7,19 @@ import {
   generateSecret,
   generateTopic,
   loadConfig,
+  resolveApiKey,
   saveConfig,
   type Config,
 } from '../core/config.js';
 import { ensurePolicyFile } from '../core/policy.js';
 import { LAUNCHD_LABEL, paths } from '../core/paths.js';
+import { buildHookEntry, mergeHook, type HookEntry } from '../hook/registry.js';
+import { discoverConfigDirs, type ConfigDir } from '../hook/discover.js';
+
+// Re-exported: these moved to hook/registry.ts when registration stopped being a
+// single-file operation. Kept here so existing importers and tests still resolve.
+export { buildHookEntry, mergeHook, removeHook, isPreymaxHook } from '../hook/registry.js';
+export type { HookEntry } from '../hook/registry.js';
 
 /**
  * `preymax init` — register hooks, install the launch agent, generate secrets.
@@ -20,100 +28,6 @@ import { LAUNCHD_LABEL, paths } from '../core/paths.js';
  * not regenerate the secret (that would invalidate every notification already on
  * your phone), and must not clobber a policy you have tuned.
  */
-
-export interface HookEntry {
-  type: 'http';
-  url: string;
-  timeout?: number;
-  headers?: Record<string, string>;
-  allowedEnvVars?: string[];
-}
-
-const HOOK_MARKER = '/hook';
-
-export function buildHookEntry(port: number): HookEntry {
-  return {
-    type: 'http',
-    url: `http://127.0.0.1:${port}${HOOK_MARKER}`,
-    // Generous relative to the daemon's own decisionTimeoutMs so the daemon
-    // always wins the race and returns a real decision. If the daemon is dead,
-    // Claude Code treats a connection failure as non-blocking and prompts
-    // normally — no waiting on this timeout.
-    timeout: 120,
-    headers: { 'X-Preymax-Name': '$PREYMAX_NAME' },
-    // Without this allowlist, $PREYMAX_NAME silently interpolates to an empty
-    // string. No warning, no error. This one line is worth hours.
-    allowedEnvVars: ['PREYMAX_NAME'],
-  };
-}
-
-function isPreymaxHook(h: unknown): boolean {
-  return (
-    !!h &&
-    typeof h === 'object' &&
-    (h as HookEntry).type === 'http' &&
-    typeof (h as HookEntry).url === 'string' &&
-    (h as HookEntry).url.includes(HOOK_MARKER) &&
-    /127\.0\.0\.1|localhost/.test((h as HookEntry).url)
-  );
-}
-
-/**
- * Merge our hook into a settings object. Pure — returns the new object and
- * whether anything changed, so it can be unit-tested without touching disk.
- */
-export function mergeHook(
-  settings: Record<string, unknown>,
-  entry: HookEntry,
-): { settings: Record<string, unknown>; changed: boolean } {
-  const next = structuredClone(settings) as Record<string, unknown>;
-  const hooks = (next.hooks ??= {}) as Record<string, unknown>;
-  const preToolUse = (hooks.PreToolUse ??= []) as Array<Record<string, unknown>>;
-
-  if (!Array.isArray(hooks.PreToolUse)) {
-    throw new Error('settings.hooks.PreToolUse exists but is not an array — refusing to modify it');
-  }
-
-  for (const group of preToolUse) {
-    const list = group.hooks;
-    if (!Array.isArray(list)) continue;
-    const idx = list.findIndex(isPreymaxHook);
-    if (idx !== -1) {
-      // Already registered. Replace in place so a port or header change takes
-      // effect, but don't add a second entry.
-      const before = JSON.stringify(list[idx]);
-      list[idx] = entry;
-      return { settings: next, changed: before !== JSON.stringify(entry) };
-    }
-  }
-
-  preToolUse.push({ matcher: '*', hooks: [entry] });
-  return { settings: next, changed: true };
-}
-
-export function removeHook(settings: Record<string, unknown>): {
-  settings: Record<string, unknown>;
-  changed: boolean;
-} {
-  const next = structuredClone(settings) as Record<string, unknown>;
-  const hooks = next.hooks as Record<string, unknown> | undefined;
-  const groups = hooks?.PreToolUse;
-  if (!Array.isArray(groups)) return { settings: next, changed: false };
-
-  let changed = false;
-  for (const group of groups as Array<Record<string, unknown>>) {
-    const list = group.hooks;
-    if (!Array.isArray(list)) continue;
-    const kept = (list as unknown[]).filter((h) => !isPreymaxHook(h));
-    if (kept.length !== list.length) changed = true;
-    group.hooks = kept;
-  }
-  // Drop groups we emptied.
-  (hooks as Record<string, unknown>).PreToolUse = (groups as Array<Record<string, unknown>>).filter(
-    (g) => !Array.isArray(g.hooks) || g.hooks.length > 0,
-  );
-  return { settings: next, changed };
-}
 
 function backupSettings(file: string): string | null {
   if (!existsSync(file)) return null;
@@ -179,7 +93,7 @@ ${argXml}
     <key>EnvironmentVariables</key>
     <dict>
         <key>PREYMAX_HOME</key>
-        <string>${escapeXml(paths.home())}</string>
+        <string>${escapeXml(paths.home())}</string>${apiKeyXml(cfg)}
     </dict>
     <key>ProcessType</key>
     <string>Background</string>
@@ -192,10 +106,77 @@ function escapeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * Bake the API key into the launch agent.
+ *
+ * launchd does not inherit the user's shell environment, so `export
+ * ANTHROPIC_API_KEY` in .zshrc never reaches the daemon — summaries silently
+ * degraded to templates for the daemon's entire life while doctor reported
+ * green (handoff bug 2). `init` runs *in* your shell, so this is the one moment
+ * the key is visible and can be handed over.
+ *
+ * The plist therefore holds a secret and is chmod 600 by the caller.
+ */
+function apiKeyXml(cfg: Config): string {
+  const key = resolveApiKey(cfg);
+  if (!key) return '';
+  return `
+        <key>ANTHROPIC_API_KEY</key>
+        <string>${escapeXml(key)}</string>`;
+}
+
 export interface InitOptions {
   installAgent: boolean;
   port?: number;
   publicBaseUrl?: string;
+  /** Repeatable --config-dir. Registered even if not yet present on disk. */
+  configDirs?: string[];
+  /** Trees to scan for .envrc / .vscode CLAUDE_CONFIG_DIR declarations. */
+  scanRoots?: string[];
+}
+
+/**
+ * Register the hook in every discovered config directory.
+ *
+ * Each file is backed up before modification. A directory that cannot be
+ * written is reported and skipped — one unwritable account must not abort
+ * registration for the others.
+ */
+export function registerHooks(dirs: ConfigDir[], entry: HookEntry): void {
+  for (const dir of dirs) {
+    const label = dir.path.replace(process.env.HOME ?? '~', '~');
+
+    if (dir.warning) {
+      console.log(`hook        ${label} — SKIPPED`);
+      console.log(`            ${dir.warning}`);
+      continue;
+    }
+    if (!dir.exists && !dir.sources.includes('explicit')) {
+      console.log(`hook        ${label} — not present, skipped`);
+      continue;
+    }
+    if (dir.error) {
+      console.log(`hook        ${label} — unreadable settings.json, skipped`);
+      console.log(`            ${dir.error}`);
+      continue;
+    }
+
+    try {
+      mkdirSync(dirname(dir.settingsPath), { recursive: true });
+      const backup = backupSettings(dir.settingsPath);
+      const settings = readSettings(dir.settingsPath);
+      const { settings: merged, changed } = mergeHook(settings, entry);
+      if (changed) {
+        writeFileSync(dir.settingsPath, JSON.stringify(merged, null, 2) + '\n');
+        console.log(`hook        ${label} — registered [${dir.sources.join(',')}]`);
+        if (backup) console.log(`            backup ${backup}`);
+      } else {
+        console.log(`hook        ${label} — already registered`);
+      }
+    } catch (err) {
+      console.log(`hook        ${label} — FAILED: ${(err as Error).message}`);
+    }
+  }
 }
 
 export function runInit(opts: InitOptions): void {
@@ -204,10 +185,20 @@ export function runInit(opts: InitOptions): void {
   // 1. Config. Preserve an existing secret and topic — regenerating either
   // would orphan every notification already sitting on the phone.
   const existing = existsSync(paths.config()) ? loadConfig() : null;
+
+  // Discover before saving: the resolved set is persisted into the config so it
+  // is visible, auditable and hand-editable rather than re-derived each run.
+  const dirs = discoverConfigDirs({
+    explicit: opts.configDirs,
+    persisted: existing?.configDirs,
+    scanRoots: opts.scanRoots,
+  });
+
   const cfg: Config = {
     ...DEFAULT_CONFIG,
     ...(existing ?? {}),
     port: opts.port ?? existing?.port ?? DEFAULT_CONFIG.port,
+    configDirs: dirs.filter((d) => d.exists || d.sources.includes('explicit')).map((d) => d.path),
     secret: existing?.secret || generateSecret(),
     notify: {
       ...DEFAULT_CONFIG.notify,
@@ -227,27 +218,20 @@ export function runInit(opts: InitOptions): void {
   const policyFile = ensurePolicyFile();
   console.log(`policy      ${policyFile}`);
 
-  // 3. Hook registration, with a backup first.
-  const settingsFile = paths.claudeSettings();
-  mkdirSync(dirname(settingsFile), { recursive: true });
-  const backup = backupSettings(settingsFile);
-  if (backup) console.log(`backup      ${backup}`);
-
-  const settings = readSettings(settingsFile);
-  const { settings: merged, changed } = mergeHook(settings, buildHookEntry(cfg.port));
-  if (changed) {
-    writeFileSync(settingsFile, JSON.stringify(merged, null, 2) + '\n');
-    console.log(`hook        registered in ${settingsFile}`);
-  } else {
-    console.log(`hook        already registered (no change)`);
-  }
+  // 3. Hook registration across every discovered config directory.
+  registerHooks(dirs, buildHookEntry(cfg.port));
 
   // 4. Launch agent.
   if (opts.installAgent) {
     const plistPath = paths.launchAgent();
     mkdirSync(dirname(plistPath), { recursive: true });
     writeFileSync(plistPath, buildLaunchAgentPlist(cfg));
+    // The plist may now carry the API key, so it must not be world-readable.
+    chmodSync(plistPath, 0o600);
     console.log(`launchd     ${plistPath}`);
+    if (resolveApiKey(cfg)) {
+      console.log('launchd     ANTHROPIC_API_KEY passed to the daemon (plist is 0600)');
+    }
     try {
       execFileSync('launchctl', ['unload', plistPath], { stdio: 'ignore' });
     } catch {

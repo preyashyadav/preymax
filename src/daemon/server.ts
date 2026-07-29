@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import { assertSafeBind, resolveBindAddresses } from './net.js';
 import { PendingStore } from './pending.js';
+import { buildStatus } from './status.js';
 import { createHash } from 'node:crypto';
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -73,6 +74,10 @@ export class Daemon {
   /** session name -> time of first escalation in the current burst. */
   private readonly burstStart = new Map<string, number>();
   private sweeper: NodeJS.Timeout | null = null;
+  /** Recorded so /status can report uptime and what we actually bound. */
+  private readonly startedAt = Date.now();
+  private boundAddresses: string[] = [];
+  private boundTailnet: string | null = null;
 
   constructor(private readonly cfg: Config) {
     this.pending = new PendingStore();
@@ -86,6 +91,8 @@ export class Daemon {
     // Throws before any listener opens if a non-loopback, non-tailnet address
     // is in the list. This is the assertion Phase 5 requires.
     assertSafeBind(addresses);
+    this.boundAddresses = addresses;
+    this.boundTailnet = tailnet;
 
     const orphaned = this.pending.recoverAndExpire();
     if (orphaned > 0) {
@@ -169,6 +176,26 @@ export class Daemon {
         publicBaseUrl: this.cfg.publicBaseUrl,
         notify: this.cfg.notify.transport,
       });
+    }
+
+    // The authoritative health surface. `preymax doctor` renders this and
+    // computes nothing itself — see daemon/status.ts for why.
+    if (req.method === 'GET' && url.pathname === '/status') {
+      return sendJson(
+        res,
+        200,
+        buildStatus({
+          cfg: this.cfg,
+          version: '0.1.0',
+          startedAt: this.startedAt,
+          addresses: this.boundAddresses,
+          tailnet: this.boundTailnet,
+          pending: this.pending.list().length,
+          grants: this.grants.list().length,
+          summarizerAvailable: this.summarizer.available,
+          summarizerStats: this.summarizer.stats,
+        }),
+      );
     }
 
     if (req.method === 'POST' && url.pathname === '/hook') {

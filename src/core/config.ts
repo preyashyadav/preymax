@@ -6,6 +6,13 @@ export interface Config {
   /** Loopback port the daemon binds. */
   port: number;
   /**
+   * Every Claude config directory preymax registers its hook in. Populated by
+   * `preymax init` via hook/discover.ts and editable by hand. A project that
+   * points CLAUDE_CONFIG_DIR at a directory missing from this list gets no hook
+   * and is invisible to preymax — see handoff bug 1.
+   */
+  configDirs: string[];
+  /**
    * Also bind the Tailscale interface address so the phone can reach us.
    * Never 0.0.0.0 — the daemon refuses to start if it resolves to one.
    */
@@ -54,6 +61,7 @@ export interface Config {
 
 export const DEFAULT_CONFIG: Config = {
   port: 7717,
+  configDirs: [],
   bindTailnet: true,
   publicBaseUrl: null,
   secret: '',

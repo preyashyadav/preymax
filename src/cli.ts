@@ -13,8 +13,14 @@ import { DaemonUnreachableError } from './commands/client.js';
 const USAGE = `preymax — named permission triage for parallel Claude Code sessions
 
   preymax init [--no-agent] [--port N] [--public-url URL]
-      Register the PreToolUse hook, generate a secret and ntfy topic,
-      write a default policy, and install the launchd agent. Idempotent.
+              [--config-dir PATH]... [--scan DIR]...
+      Discover every Claude config directory (~/.claude, ~/.claude-*,
+      CLAUDE_CONFIG_DIR in the environment and shell rc files) and register
+      the PreToolUse hook in each. Generates a secret and ntfy topic, writes a
+      default policy, installs the launchd agent. Idempotent.
+      --config-dir  register an additional directory explicitly (repeatable)
+      --scan        also search a project tree for CLAUDE_CONFIG_DIR in
+                    .envrc and .vscode/settings.json (repeatable)
 
   preymax daemon
       Run the daemon in the foreground. Normally launchd does this for you.
@@ -54,6 +60,17 @@ function value(argv: string[], name: string): string | undefined {
   if (i === -1) return undefined;
   const v = argv[i + 1];
   return v && !v.startsWith('--') ? v : undefined;
+}
+
+/** Every occurrence of a repeatable flag, e.g. --config-dir a --config-dir b. */
+function values(argv: string[], name: string): string[] {
+  const out: string[] = [];
+  argv.forEach((a, i) => {
+    if (a !== name) return;
+    const v = argv[i + 1];
+    if (v && !v.startsWith('--')) out.push(v);
+  });
+  return out;
 }
 
 async function runDaemon(): Promise<number> {
@@ -122,10 +139,14 @@ async function main(): Promise<number> {
 
     case 'init': {
       const port = value(argv, '--port');
+      const configDirs = values(argv, '--config-dir');
+      const scanRoots = values(argv, '--scan');
       runInit({
         installAgent: !flag(argv, '--no-agent'),
         ...(port ? { port: Number(port) } : {}),
         ...(value(argv, '--public-url') ? { publicBaseUrl: value(argv, '--public-url')! } : {}),
+        ...(configDirs.length ? { configDirs } : {}),
+        ...(scanRoots.length ? { scanRoots } : {}),
       });
       return 0;
     }

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import type { DaemonStatus } from '../daemon/status.js';
 import { loadConfig } from '../core/config.js';
 import { makeApproval } from '../core/hmac.js';
 import { paths } from '../core/paths.js';
@@ -57,6 +58,17 @@ export async function fetchPending(): Promise<PendingSummary[]> {
 export async function fetchHealth(): Promise<Record<string, unknown>> {
   const res = await request('/health');
   return (await res.json()) as Record<string, unknown>;
+}
+
+/**
+ * The daemon's own view. Everything `doctor` reports about hooks, policy, log
+ * and summarizer comes from here — a check that runs in the CLI process reads
+ * the CLI's environment, which is not the environment the daemon runs in.
+ */
+export async function fetchStatus(): Promise<DaemonStatus> {
+  const res = await request('/status');
+  if (!res.ok) throw new Error(`daemon returned ${res.status} for /status`);
+  return (await res.json()) as DaemonStatus;
 }
 
 export async function fetchGrants(): Promise<unknown[]> {

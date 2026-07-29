@@ -6,3 +6,7 @@ dist-test/
 .env
 .env.*
 !.env.example
+PLAN.md
+PLANv2.md
+THREAT_MODEL.md
+HANDOFF.md
