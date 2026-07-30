@@ -59,11 +59,21 @@ know it's preymax before you look.
 
 ## 3. Action buttons
 
-Buttons appear when preymax knows a URL your phone can reach:
+Buttons appear when preymax knows a URL your phone can reach.
+
+**The daemon speaks plain HTTP and never TLS** (`src/daemon/server.ts` uses
+`node:http`), so it cannot serve an `https://` URL itself. Terminate TLS with
+Tailscale Serve, which provisions a real certificate for your `.ts.net` name:
 
 ```sh
-preymax init --public-url https://<your-mac>.<your-tailnet>.ts.net:7717
+# One-time: enable HTTPS certificates at login.tailscale.com/admin/dns
+tailscale serve --bg --https=443 http://127.0.0.1:7717
+preymax relay enable --public-url https://<your-mac>.<your-tailnet>.ts.net
 ```
+
+Note there is **no port** in that URL — Serve is fronting the daemon on 443.
+With Serve in place the daemon only needs loopback, so you can also set
+`"bindTailnet": false`, which is strictly less exposed.
 
 Each escalation then carries **Allow**, **Deny**, and **Allow 30m**. Long-press
 (or pull down on) the notification to reveal them.
@@ -76,8 +86,9 @@ If the buttons do nothing:
 
 - Is Tailscale connected on **both** the phone and the Mac?
 - Does `preymax doctor` report the tailnet bound?
+- Is `tailscale serve status` showing the proxy?
 - Is `publicBaseUrl` reachable from the phone's browser? Try loading
-  `https://<mac>.<tailnet>.ts.net:7717/health`.
+  `https://<mac>.<tailnet>.ts.net/health` (no port).
 
 ## 4. Speech (optional)
 

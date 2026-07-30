@@ -126,9 +126,14 @@ configuration is wrong.
 
 Action buttons need a URL your phone can reach:
 
+The daemon speaks plain HTTP, so TLS is terminated by Tailscale Serve:
+
 ```sh
-preymax init --public-url https://<your-mac>.<your-tailnet>.ts.net:7717
+tailscale serve --bg --https=443 http://127.0.0.1:7717
+preymax relay enable --public-url https://<your-mac>.<your-tailnet>.ts.net
 ```
+
+(No port in that URL — Serve fronts the daemon on 443.)
 
 Until you set this, notifications are **read-only** — you still learn which
 terminal stopped and why, and you approve at the Mac. The daemon binds loopback

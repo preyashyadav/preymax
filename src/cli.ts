@@ -7,6 +7,8 @@ import { runInit } from './commands/init.js';
 import { runTail } from './commands/tail.js';
 import { runDecide, runGrants, runPending } from './commands/decide.js';
 import { runStats } from './commands/stats.js';
+import { runSuggest } from './commands/suggest.js';
+import { runShadow, runRelay } from './commands/mode.js';
 import { runDoctor } from './commands/doctor.js';
 import { DaemonUnreachableError } from './commands/client.js';
 
@@ -42,6 +44,19 @@ const USAGE = `preymax — named permission triage for parallel Claude Code sess
 
   preymax stats [--hours N]
       Escalation rate, per-terminal volume, latency percentiles.
+
+  preymax suggest [--hours N] [--apply] [--include-review] [--min-count N]
+      Mine the event log for auto-allow candidates and score them for
+      safety. --apply writes the ones marked safe into policy.yaml, backed
+      up and annotated. This is the command that reduces interruptions.
+
+  preymax shadow on|off
+      Shadow mode: log every escalation, decide nothing, notify nobody,
+      never stall a terminal. The mode you measure in.
+
+  preymax relay enable|disable [--public-url URL]
+      The notification and remote-approval layer. Off by default; when off
+      it is never even loaded.
 
   preymax doctor [--push]
       Verify hooks, daemon, tailnet, and (with --push) real push delivery.
@@ -172,6 +187,20 @@ async function main(): Promise<number> {
 
     case 'stats':
       return runStats(Number(value(argv, '--hours') ?? 24));
+
+    case 'suggest':
+      return runSuggest({
+        hours: Number(value(argv, '--hours') ?? 168),
+        apply: flag(argv, '--apply'),
+        includeReview: flag(argv, '--include-review'),
+        minCount: Number(value(argv, '--min-count') ?? 3),
+      });
+
+    case 'shadow':
+      return runShadow(argv[1]);
+
+    case 'relay':
+      return runRelay(argv[1], value(argv, '--public-url'));
 
     case 'doctor':
       return runDoctor({ push: flag(argv, '--push') });

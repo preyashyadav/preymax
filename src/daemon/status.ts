@@ -45,7 +45,7 @@ export interface DaemonStatus {
     model: string;
     /** Why it is unavailable, in the daemon's own terms. */
     reason: string;
-    stats: { hits: number; misses: number; errors: number; timeouts: number };
+    stats: SummarizerStats;
   };
   relay: {
     enabled: boolean;
@@ -53,8 +53,23 @@ export interface DaemonStatus {
     publicBaseUrl: string | null;
     decisionTimeoutMs: number;
   };
+  shadow: boolean;
   pending: number;
   grants: number;
+}
+
+/**
+ * `ok` counts summaries the model actually returned. Without it, a summarizer
+ * that has failed every single call is indistinguishable from one that has
+ * never been asked — which is how a 21-error, 0-success summarizer reported
+ * green for a day.
+ */
+export interface SummarizerStats {
+  ok: number;
+  hits: number;
+  misses: number;
+  errors: number;
+  timeouts: number;
 }
 
 export interface StatusInputs {
@@ -66,7 +81,7 @@ export interface StatusInputs {
   pending: number;
   grants: number;
   summarizerAvailable: boolean;
-  summarizerStats: { hits: number; misses: number; errors: number; timeouts: number };
+  summarizerStats: SummarizerStats;
 }
 
 function toStatus(d: ConfigDir): ConfigDirStatus {
@@ -124,7 +139,9 @@ export function buildStatus(input: StatusInputs): DaemonStatus {
     policyError = (err as Error).message;
   }
 
-  const log = writable(paths.events());
+  // Events are written to the daily directory, not v1's single file. Report
+  // what is actually being written to, or doctor greenlights the wrong path.
+  const log = writable(paths.logDir());
 
   return {
     ok: true,
@@ -139,7 +156,7 @@ export function buildStatus(input: StatusInputs): DaemonStatus {
       allowRules,
       ...(policyError ? { error: policyError } : {}),
     },
-    log: { path: paths.events(), ...log },
+    log: { path: paths.logDir(), ...log },
     summarizer: {
       enabled: cfg.summarize.enabled,
       available: input.summarizerAvailable,
@@ -148,12 +165,16 @@ export function buildStatus(input: StatusInputs): DaemonStatus {
       stats: input.summarizerStats,
     },
     relay: {
-      // v2 splits the relay out; until then, "enabled" means a transport is set.
-      enabled: cfg.notify.transport !== 'none',
+      // `relay.enabled` is the flag `preymax relay enable|disable` writes, and
+      // the one the daemon branches on. Deriving this from the transport (as it
+      // did before that flag existed) made doctor report an enabled relay
+      // minutes after it had been disabled — standing rule 3, one directory up.
+      enabled: cfg.relay.enabled,
       transport: cfg.notify.transport,
       publicBaseUrl: cfg.publicBaseUrl,
       decisionTimeoutMs: cfg.decisionTimeoutMs,
     },
+    shadow: cfg.shadow,
     pending: input.pending,
     grants: input.grants,
   };

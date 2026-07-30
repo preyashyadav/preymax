@@ -30,6 +30,40 @@ function short(p: string): string {
   return home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
 }
 
+/**
+ * A constructed summarizer is not a working summarizer. `available` only means
+ * the daemon holds an API key, so reporting it green hid a run of 21 failed
+ * calls and 0 successes — the summary layer had never worked at all. Grade on
+ * outcomes: what came back, and what did not.
+ */
+function summarizerHealth(s: DaemonStatus['summarizer']): Check {
+  const { ok, hits, errors, timeouts } = s.stats;
+  const attempts = ok + errors + timeouts;
+  const tally = `${ok} ok, ${hits} cached, ${errors} errors, ${timeouts} timeouts`;
+
+  if (attempts === 0) {
+    return { name: 'summaries', status: 'ok', detail: `${s.model} · ready, nothing summarized yet` };
+  }
+  if (ok === 0 && hits === 0) {
+    return {
+      name: 'summaries',
+      status: 'fail',
+      detail: `${s.model} · never succeeded — ${tally}, every notification used the template`,
+      fix:
+        timeouts >= errors
+          ? 'raise summaryBudgetMs in ~/.preymax/config.json — the model is slower than the budget'
+          : 'check the key and model in the launchd plist: preymax init',
+    };
+  }
+  // Some working, some not. Worth a flag but not a failure — the template
+  // summary is a correct fallback, only a less readable one.
+  const failed = errors + timeouts;
+  if (failed > 0 && failed >= attempts / 2) {
+    return { name: 'summaries', status: 'warn', detail: `${s.model} · degraded — ${tally}` };
+  }
+  return { name: 'summaries', status: 'ok', detail: `${s.model} · ${tally}` };
+}
+
 function humanUptime(ms: number): string {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -209,9 +243,14 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
       ? { name: 'tailnet', status: 'ok', detail: `bound ${status.bind.tailnet}` }
       : {
           name: 'tailnet',
-          status: 'warn',
-          detail: 'not bound — the phone cannot reach the daemon',
-          fix: 'install and start Tailscale, then restart the daemon',
+          // Only worth flagging if you actually intend to use the phone.
+          status: status.relay.enabled ? 'warn' : 'ok',
+          detail: status.relay.enabled
+            ? 'not bound — the phone cannot reach the daemon'
+            : 'not bound (not needed — the relay is off)',
+          ...(status.relay.enabled
+            ? { fix: 'start Tailscale, then restart the daemon' }
+            : {}),
         },
   );
 
@@ -234,11 +273,7 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
   // Summarizer — the daemon's answer, in the daemon's environment.
   checks.push(
     status.summarizer.available
-      ? {
-          name: 'summaries',
-          status: 'ok',
-          detail: `${status.summarizer.model} · ${status.summarizer.stats.hits} cached, ${status.summarizer.stats.errors} errors`,
-        }
+      ? summarizerHealth(status.summarizer)
       : {
           name: 'summaries',
           // Not running because the relay is off is the expected v2 default,
@@ -252,7 +287,9 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
   );
 
   // Shadow mode is a deliberate state, and doctor must not present it as broken.
-  if (status.relay.decisionTimeoutMs <= 1000 && !status.relay.enabled) {
+  // Read the flag; the old `decisionTimeoutMs <= 1000` inference was detecting
+  // v1's hand-rolled shadow hack, which `preymax shadow on` replaced.
+  if (status.shadow) {
     checks.push({
       name: 'shadow mode',
       status: 'ok',

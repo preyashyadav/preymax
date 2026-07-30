@@ -83,7 +83,11 @@ export const DEFAULT_CONFIG: Config = {
   publicBaseUrl: null,
   secret: '',
   decisionTimeoutMs: 60_000,
-  summaryBudgetMs: 800,
+  // Measured Haiku latency for a summarize-shaped call on this workload is
+  // 610-750ms, so the plan's 800ms ceiling aborted very nearly every call and
+  // the model summary never once shipped. 2s clears it with headroom and is
+  // still invisible next to the 60s decision window it sits inside.
+  summaryBudgetMs: 2_000,
   dedupeWindowMs: 30_000,
   burstWindowMs: 5_000,
   nonceTtlMs: 5 * 60_000,

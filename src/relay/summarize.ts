@@ -39,13 +39,20 @@ export interface SummaryResult {
   source: 'model' | 'cache';
 }
 
+/** True for an abort however the SDK chooses to spell it. */
+function isAbort(err: unknown): boolean {
+  const e = err as { name?: string; constructor?: { name?: string } } | null;
+  if (!e) return false;
+  return e.name === 'AbortError' || e.constructor?.name === 'APIUserAbortError';
+}
+
 export class Summarizer {
   private client: Anthropic | null = null;
   private readonly cache = new Map<string, string>();
   private readonly maxCacheEntries = 500;
 
-  /** Observability for `preymax stats`. */
-  public stats = { hits: 0, misses: 0, errors: 0, timeouts: 0 };
+  /** Observability for `preymax stats` and `doctor`. */
+  public stats = { ok: 0, hits: 0, misses: 0, errors: 0, timeouts: 0 };
 
   constructor(private readonly cfg: Config) {
     const apiKey = resolveApiKey(cfg);
@@ -121,9 +128,14 @@ export class Summarizer {
       }
 
       this.remember(fingerprint, text);
+      this.stats.ok++;
       return { text, source: 'model' };
     } catch (err) {
-      if ((err as Error).name === 'AbortError') this.stats.timeouts++;
+      // The SDK raises APIUserAbortError on `signal`, and its `.name` is the
+      // inherited "Error" — not "AbortError". Testing the name alone filed every
+      // budget overrun as an error, which hid the real cause (a budget below the
+      // model's own latency) behind a stat that pointed nowhere. Ask the signal.
+      if (signal?.aborted || isAbort(err)) this.stats.timeouts++;
       else this.stats.errors++;
       return null;
     }
@@ -138,8 +150,9 @@ export class Summarizer {
    * model returns. ntfy has no edit-message API, so an in-place replacement
    * would mean a second buzz for every escalation — exactly the notification
    * fatigue the plan names as the primary failure mode. Instead the model call
-   * is capped at `summaryBudgetMs` (default 800ms, the plan's own ceiling) and
-   * one notification is sent with whichever summary won. Cache hits resolve
+   * is capped at `summaryBudgetMs` (default 2s — see config.ts for why not the
+   * plan's 800ms) and one notification is sent with whichever summary won.
+   * Cache hits resolve
    * instantly, so the steady state is the model wording at zero added latency.
    */
   async summarizeWithinBudget(
