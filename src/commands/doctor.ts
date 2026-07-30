@@ -36,7 +36,35 @@ function short(p: string): string {
  * calls and 0 successes — the summary layer had never worked at all. Grade on
  * outcomes: what came back, and what did not.
  */
-function summarizerHealth(s: DaemonStatus['summarizer']): Check {
+/**
+ * An approve URL the phone cannot load is worse than none at all: the buttons
+ * render and then do nothing. iOS will not POST from a notification action to
+ * plain HTTP, and the daemon speaks `node:http` and never TLS — so the only
+ * shape that works is an https `.ts.net` name fronted by Tailscale Serve
+ * (PLANv2 §6). This machine spent M7 pointed at `http://<tailnet-ip>:7717`.
+ */
+export function approveUrlHealth(url: string, port: number): Check {
+  const name = 'approve URL';
+  const serve = `tailscale serve --bg --https=443 http://127.0.0.1:${port}`;
+  if (!url.startsWith('https://')) {
+    return {
+      name,
+      status: 'fail',
+      detail: `${url} — plain HTTP, so the notification buttons will not work`,
+      fix: `${serve}   then  preymax relay enable --public-url https://<mac>.<tailnet>.ts.net`,
+    };
+  }
+  return /:\d+$/.test(new URL(url).host)
+    ? {
+        name,
+        status: 'warn',
+        detail: `${url} — carries a port, so it is not being fronted by Serve on 443`,
+        fix: `${serve}   then re-set the URL without the port`,
+      }
+    : { name, status: 'ok', detail: url };
+}
+
+export function summarizerHealth(s: DaemonStatus['summarizer']): Check {
   const { ok, hits, errors, timeouts } = s.stats;
   const attempts = ok + errors + timeouts;
   const tally = `${ok} ok, ${hits} cached, ${errors} errors, ${timeouts} timeouts`;
@@ -254,20 +282,30 @@ export async function runDoctor(opts: { push: boolean }): Promise<number> {
         },
   );
 
-  // Approve URL / action buttons.
+  // Approve URL / action buttons. Only meaningful with the relay on: with it
+  // off there is nothing to approve, and a green tick on a stale URL is how
+  // this machine came to spend M7 pointed at an address the phone could not use.
   checks.push(
-    status.relay.publicBaseUrl
-      ? { name: 'approve URL', status: 'ok', detail: status.relay.publicBaseUrl }
-      : {
+    !status.relay.enabled
+      ? {
           name: 'approve URL',
-          status: 'warn',
-          detail: 'not set — notifications have no action buttons (read-only)',
-          // The daemon speaks plain HTTP; TLS is terminated by Tailscale Serve
-          // on 443, so the URL carries no port. See docs/ios-shortcuts.md.
-          fix:
-            `tailscale serve --bg --https=443 http://127.0.0.1:${status.bind.port}` +
-            '  then  preymax init --public-url https://<mac>.<tailnet>.ts.net',
-        },
+          status: 'ok',
+          detail: status.relay.publicBaseUrl
+            ? `${status.relay.publicBaseUrl} ${DIM}(unused — the relay is off)${RESET}`
+            : 'not needed — the relay is off',
+        }
+      : status.relay.publicBaseUrl
+        ? approveUrlHealth(status.relay.publicBaseUrl, status.bind.port)
+        : {
+            name: 'approve URL',
+            status: 'warn',
+            detail: 'not set — notifications have no action buttons (read-only)',
+            // The daemon speaks plain HTTP; TLS is terminated by Tailscale Serve
+            // on 443, so the URL carries no port. See docs/ios-shortcuts.md.
+            fix:
+              `tailscale serve --bg --https=443 http://127.0.0.1:${status.bind.port}` +
+              '  then  preymax relay enable --public-url https://<mac>.<tailnet>.ts.net',
+          },
   );
 
   // Summarizer — the daemon's answer, in the daemon's environment.

@@ -180,7 +180,7 @@ export class Daemon {
           grants: this.relay?.grants.list().length ?? 0,
           summarizerAvailable: this.relay?.summarizerAvailable ?? false,
           summarizerStats:
-            this.relay?.summarizerStats ?? { hits: 0, misses: 0, errors: 0, timeouts: 0 },
+            this.relay?.summarizerStats ?? { ok: 0, hits: 0, misses: 0, errors: 0, timeouts: 0 },
         }),
       );
     }

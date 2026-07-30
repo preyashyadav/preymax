@@ -69,6 +69,25 @@ const SAFE_TOOLS = new Set([
   'AskUserQuestion', 'Read', 'Glob', 'Grep', 'NotebookRead', 'TodoWrite', 'TaskList',
 ]);
 
+/**
+ * Tools with no safe whole-tool rule. `policy.yaml` matches tools by name and
+ * Bash by command; there is no per-path form, so the only rule that can be
+ * written for `Edit` is *every edit, anywhere*. Suggesting one as `review` was
+ * not a smaller version of that — `--include-review` applied it verbatim, and
+ * this machine spent a day auto-allowing writes to `~/.ssh/authorized_keys`.
+ * Until a path-scoped rule exists, these are never suggested at any level.
+ */
+const UNSCOPABLE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit']);
+
+/**
+ * Sessions that generate load rather than doing work. Benchmarks hit the same
+ * daemon and land in the same log, so a latency run of 120 `npx prisma migrate
+ * reset` calls reads as the top policy candidate on the machine — which is
+ * exactly how `^npx\b` came to be auto-allowed here. Excluded from the report
+ * entirely: no count, no share, no denominator.
+ */
+const SYNTHETIC_SESSIONS = new Set(['bench', 'benchmark', 'loadtest']);
+
 /** A summary carrying one of these has touched something sensitive. */
 const SENSITIVE = /\[redacted\]|secret|token|password|api[_-]?key|credential/i;
 
@@ -129,8 +148,11 @@ function scoreBash(
 function scoreTool(tool: string, denied: number): { safety: Safety; reason: string } {
   if (denied > 0) return { safety: 'unsafe', reason: `denied ${denied}× — never suggested` };
   if (SAFE_TOOLS.has(tool)) return { safety: 'safe', reason: 'interaction or read-only tool' };
-  if (['Write', 'Edit', 'NotebookEdit'].includes(tool)) {
-    return { safety: 'review', reason: 'writes files — allow per-path, not wholesale' };
+  if (UNSCOPABLE_TOOLS.has(tool)) {
+    return {
+      safety: 'unsafe',
+      reason: 'writes files, and a tool rule cannot be scoped to a path — never suggested',
+    };
   }
   return { safety: 'review', reason: 'unrecognised tool' };
 }
@@ -142,8 +164,15 @@ export function patternFor(kind: 'bash' | 'tool', shape: string): string {
   return `^${escaped}\\b${GUARD}`;
 }
 
+/** A load generator's traffic is not evidence about how you work. */
+export function isSyntheticSession(session: string | undefined): boolean {
+  return session !== undefined && SYNTHETIC_SESSIONS.has(session.split(':')[0]!.toLowerCase());
+}
+
 export function buildReport(events: EventRecord[], windowHours: number): SuggestReport {
-  const escalations = events.filter((e) => e.event === 'escalation');
+  const escalations = events.filter(
+    (e) => e.event === 'escalation' && !isSyntheticSession(e.session),
+  );
 
   // fingerprint -> final decision, so a shape can be scored on outcomes.
   const outcome = new Map<string, { decision?: string; source?: string }>();

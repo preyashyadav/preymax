@@ -1,4 +1,5 @@
 import type { Config } from '../core/config.js';
+import type { SummarizerStats } from '../daemon/status.js';
 import { verify } from '../core/hmac.js';
 import { logEvent } from '../log/events.js';
 import type { PermissionDecision, SessionIdentity } from '../types.js';
@@ -58,7 +59,7 @@ export class Relay {
     return this.summarizer.available;
   }
 
-  get summarizerStats(): { hits: number; misses: number; errors: number; timeouts: number } {
+  get summarizerStats(): SummarizerStats {
     return this.summarizer.stats;
   }
 

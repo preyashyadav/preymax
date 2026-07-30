@@ -115,10 +115,13 @@ describe('scoring', () => {
     assert.equal(r.suggestions[0]!.approved, 1);
   });
 
-  it('treats file-writing tools as review, not safe', () => {
+  // Was `review` until a `--include-review` run applied it verbatim and
+  // auto-allowed every write on the machine. A tool rule cannot carry a path,
+  // so there is no smaller version of it to apply — hence `unsafe`.
+  it('treats file-writing tools as unsafe: a tool rule cannot be scoped', () => {
     for (const tool of ['Write', 'Edit', 'NotebookEdit']) {
       const r = buildReport([esc(tool, `write: /tmp/x`)], 24);
-      assert.equal(r.suggestions[0]!.safety, 'review', tool);
+      assert.equal(r.suggestions[0]!.safety, 'unsafe', tool);
     }
   });
 
@@ -180,5 +183,34 @@ describe('rendered rules', () => {
     const policy = parsePolicy(next);
     assert.equal(evaluate(policy, 'Bash', { command: 'npx tsc --noEmit' }).bucket, 'auto_allow');
     assert.equal(evaluate(policy, 'Bash', { command: 'npx tsc && rm -rf /' }).bucket, 'escalate');
+  });
+});
+
+describe('suggest: rules that cannot be written safely', () => {
+  function escalation(tool: string, session = 'preymax', summary = ''): EventRecord {
+    return {
+      ts: new Date().toISOString(),
+      event: 'escalation',
+      session,
+      tool,
+      summary,
+      fingerprint: `${tool}-${session}-${summary}`,
+    } as EventRecord;
+  }
+
+  it('excludes benchmark traffic from counts and from the denominator', () => {
+    const events = [
+      ...Array.from({ length: 120 }, () =>
+        escalation('Bash', 'bench', 'run: npx prisma migrate reset'),
+      ),
+      ...Array.from({ length: 3 }, () => escalation('Bash', 'preymax', 'run: cd /tmp')),
+    ];
+    const report = buildReport(events, 24);
+    assert.equal(report.escalations, 3);
+    assert.equal(
+      report.suggestions.find((s) => s.shape === 'npx'),
+      undefined,
+    );
+    assert.equal(report.suggestions.find((s) => s.shape === 'cd')?.count, 3);
   });
 });
