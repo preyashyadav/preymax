@@ -59,11 +59,15 @@ function daemonEntrypoint(): string {
 export function buildLaunchAgentPlist(cfg: Config): string {
   const node = process.execPath;
   const cli = daemonEntrypoint();
-  const args = cfg.caffeinate
-    ? // caffeinate -dis: no display sleep, no idle sleep, no system sleep while
-      // the daemon runs. This has a real battery cost — documented in the README.
-      ['/usr/bin/caffeinate', '-dis', node, cli, 'daemon']
-    : [node, cli, 'daemon'];
+  // caffeinate -dis: no display sleep, no idle sleep, no system sleep while the
+  // daemon runs. The *only* reason to keep the Mac awake is so a phone can
+  // reach it, so this is gated on the relay as well as the flag — a sleeping
+  // Mac costs a local-only install nothing (PLANv2 §3). Real battery cost when
+  // it does apply; documented in the README.
+  const args =
+    cfg.caffeinate && cfg.relay.enabled
+      ? ['/usr/bin/caffeinate', '-dis', node, cli, 'daemon']
+      : [node, cli, 'daemon'];
 
   const argXml = args.map((a) => `      <string>${escapeXml(a)}</string>`).join('\n');
 

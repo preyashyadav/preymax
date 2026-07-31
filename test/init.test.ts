@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildHookEntry, mergeHook, removeHook } from '../src/commands/init.js';
+import { buildHookEntry, buildLaunchAgentPlist, mergeHook, removeHook } from '../src/commands/init.js';
+import { DEFAULT_CONFIG } from '../src/core/config.js';
 import { GrantStore, grantPatternFor } from '../src/relay/grants.js';
 import { templateSummary, notificationBody } from '../src/core/template.js';
 import { resolveIdentity } from '../src/core/identity.js';
@@ -209,5 +210,35 @@ describe('session identity resolution', () => {
     const id = resolveIdentity({ ...payload, cwd: '/' }, undefined);
     assert.equal(id.source, 'session_id');
     assert.equal(id.name, 'abcdef');
+  });
+});
+
+describe('launch agent: caffeinate is gated on the relay', () => {
+  const base = { ...DEFAULT_CONFIG, configDirs: [], secret: 'x' };
+
+  it('does not keep the Mac awake for a local-only install', () => {
+    // The only reason to hold sleep off is so a phone can reach the daemon.
+    // v2 ships with no phone, so the default install must cost no battery.
+    const plist = buildLaunchAgentPlist({ ...base, caffeinate: true });
+    assert.equal(plist.includes('caffeinate'), false);
+  });
+
+  it('keeps it awake once the relay is on and the flag is set', () => {
+    const plist = buildLaunchAgentPlist({
+      ...base,
+      caffeinate: true,
+      relay: { ...base.relay, enabled: true },
+    });
+    assert.match(plist, /\/usr\/bin\/caffeinate/);
+    assert.match(plist, /-dis/);
+  });
+
+  it('stays off when the flag is off, relay or not', () => {
+    const plist = buildLaunchAgentPlist({
+      ...base,
+      caffeinate: false,
+      relay: { ...base.relay, enabled: true },
+    });
+    assert.equal(plist.includes('caffeinate'), false);
   });
 });

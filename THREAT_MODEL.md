@@ -11,12 +11,19 @@ file is in the repo rather than in someone's notes.
 
 ## What preymax is not
 
-- **Not a sandbox.** The policy engine's `auto_deny` bucket is a regex filter.
-  It stops the obvious footguns; it does not stop a determined command. `rm -rf`
-  is caught, `python -c "import shutil; shutil.rmtree('/')"` is not.
+- **Not a sandbox, and no longer even a filter.** v1 had an `auto_deny` bucket
+  of regexes. It fired once in 48 hours, on a legitimate `rm -rf` of a temp
+  directory, and it was **deleted** (PLANv2 §3). A regex that stops `rm -rf`
+  never stopped `python -c "import shutil; shutil.rmtree('/')"`, so the bucket
+  bought a false sense of a boundary and one false positive.
 - **Not a security boundary.** Real guarantees belong in Claude Code's native
-  `permissions.deny`, which preymax does not replace. Anything preymax denies,
-  a differently-spelled command can evade.
+  `permissions.deny`, which preymax does not replace or duplicate. preymax has
+  exactly two outcomes: `auto_allow`, or escalate to the normal prompt.
+- **Therefore every allow rule must be safe alone.** With no deny bucket there
+  is nothing behind a rule to catch the tail of a chained command, which is why
+  every generated Bash rule ends in `[^;&|><$`\n]*$`. Without it `^echo\b`
+  would permit `echo SECRET=x > .env`. See "the single most important line of
+  code" below.
 - **Not an audit log you can rely on for forensics.** `events.jsonl` is a
   best-effort operational log. Write failures are swallowed on purpose, because
   the alternative is crashing on the permission-gate path.
@@ -119,27 +126,21 @@ leaving the promise dangling and the hook without any response at all.
 | Daemon not running | Claude Code treats a connection failure to an `http` hook as a **non-blocking error** and proceeds with the normal permission flow. Verified against the hooks reference. |
 | Daemon hangs | Hook's own `timeout` (120s, set by `preymax init`) fires; non-blocking error; normal flow. |
 | ntfy down or slow | Notification is skipped or fails; the escalation still exists and `preymax approve` still resolves it. Push is never awaited on the decision path. |
-| Anthropic API down, slow, or rate-limited | Model summary loses its 800ms race; the template summary ships. No user-visible error. |
+| Anthropic API down, slow, or rate-limited | Model summary loses its `summaryBudgetMs` race (default 2s); the template summary ships. No user-visible error — but it is counted, and `doctor` reports a summarizer that never succeeds as **failed** rather than green. |
 | Policy file corrupt | `loadPolicy()` throws at load; the daemon refuses to start with a message. A malformed regex is caught at parse time rather than silently never matching. |
 | `pending.json` unwritable | Daemon operates in memory. A restart then loses pending state — the fail-closed direction. |
 | Clock skew on the phone | Approvals more than 60s in the future are rejected; more than the TTL in the past are rejected. |
 
 ---
 
-## Unresolved: `defer`
+## Settled: `defer`
 
-The hooks reference lists a fourth `permissionDecision` value, `defer`, but the
-section describing its semantics was truncated in the copy retrieved on
-2026-07-25. The plan assumed `defer` preserves the pending tool call in the
-transcript and exits with a `tool_deferred` stop reason; the one-line
-description actually retrieved says only "let the normal permission flow apply",
-which is a materially different behavior.
-
-**preymax never emits `defer`.** Until the semantics are confirmed against a
-live Claude Code build, the blocking approach is what ships. If `defer` does
-preserve the pending call, it is strictly better than holding a hook open for 60
-seconds and should be prototyped — that is the open question the plan flags for
-Phase 5, and it remains open.
+Closed by PLANv2 §6, and not to be reopened. `defer` is functionally `ask` — it
+lets the normal permission flow apply, which is what preymax's own fail-safe
+path already does. It does **not** preserve a pending tool call for later
+resolution, so it is not the cheaper alternative to holding a hook open that the
+v1 plan hoped for. **preymax never emits `defer`**, and there is nothing left to
+prototype.
 
 ---
 

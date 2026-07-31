@@ -158,17 +158,20 @@ If it is "phone in pocket on silent," it does not. Setup:
 
 ## Honest costs
 
-- **Battery.** The launch agent runs under `caffeinate -dis` so the Mac stays
-  reachable — no display sleep, no idle sleep, no system sleep while the daemon
-  runs. On battery this is significant. Set `"caffeinate": false` in
-  `config.json` and re-run `preymax init` to disable it; the daemon then becomes
-  unreachable when the Mac sleeps, and hooks fall through to normal prompts.
+- **Battery: none by default.** Keeping the Mac awake only buys reachability for
+  a phone, so `caffeinate` is off unless you both set `"caffeinate": true` and
+  enable the relay. When it is on, the launch agent runs under `caffeinate -dis`
+  — no display, idle, or system sleep while the daemon runs, which is
+  significant on battery. With it off, a sleeping Mac makes the daemon
+  unreachable and hooks fall through to normal prompts, which is the intended
+  local-only behaviour.
 - **Tokens.** Summaries use Claude Haiku 4.5 ($1/$5 per MTok) with a
   fingerprint cache, so a repeated command is paid for once. Roughly 200 input
   and 30 output tokens per unique escalation. Set `summarize.enabled: false` for
   template-only summaries and zero cost.
-- **Latency.** The model call is capped at `summaryBudgetMs` (800ms) and races
-  the template. A cache hit is instant.
+- **Latency.** The model call is capped at `summaryBudgetMs` (2s) and races the
+  template. A cache hit is instant. None of this touches the hook path: with the
+  relay off, `src/relay/**` is never even imported (measured p50 1.03ms).
 - **Privacy.** Redacted tool inputs go to ntfy and to the Anthropic API. On
   public ntfy.sh, **the topic name is the only access control** — anyone who
   knows it reads your notifications.
@@ -176,8 +179,9 @@ If it is "phone in pocket on silent," it does not. Setup:
 ## What preymax is not
 
 - **Not a sandbox, and not a security product.** The policy engine reduces
-  noise. `auto_deny` is a regex filter that stops obvious footguns and nothing
-  more. Real guarantees belong in Claude Code's native `permissions.deny`.
+  noise, nothing more. There is deliberately no deny bucket — v1 had one, it
+  fired once in 48 hours on a false positive, and it was deleted. Real
+  guarantees belong in Claude Code's native `permissions.deny`.
 - **Not a remote Claude Code client.** You are not driving sessions from the
   phone; you are unblocking them.
 - **Not cross-platform.** macOS host, iOS phone.

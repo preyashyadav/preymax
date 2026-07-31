@@ -1,3 +1,14 @@
+> ## ⛔ Superseded — historical record only
+>
+> This is the v1 plan. **`PLANv2.md` replaces it** and is the document to read.
+> Kept because its Phase 0 kill gate, its exit criteria, and its stop condition
+> are what v2 was judged against — not because any of it is still the plan.
+>
+> Materially wrong here, corrected in v2: `auto_deny` (deleted, §3); Phase 5/6
+> ordering (the phone is an optional layer, not a phase, §1); `defer` (settled,
+> §6); "no third-party dependency" (never load-bearing, §6). Phase 0 itself was
+> skipped during v1 and was finally written and resolved in `PLANv2 §1`.
+
 # preymax
 
 **Named, voice-summarized permission triage for parallel Claude Code sessions.**

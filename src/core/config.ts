@@ -111,7 +111,9 @@ export const DEFAULT_CONFIG: Config = {
     model: 'claude-haiku-4-5',
     apiKey: null,
   },
-  caffeinate: true,
+  // Off by default, and ignored entirely while the relay is off: keeping the
+  // Mac awake only buys reachability for a phone, and v2 ships with no phone.
+  caffeinate: false,
 };
 
 function deepMerge<T>(base: T, patch: unknown): T {
