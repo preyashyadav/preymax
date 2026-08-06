@@ -5,7 +5,7 @@ import { resolveIdentity } from '../core/identity.js';
 import { logEvent } from '../log/events.js';
 import { evaluate, loadPolicy, type Policy } from '../core/policy.js';
 import { normalizeForFingerprint, redactToolInput } from '../core/redact.js';
-import { templateSummary } from '../core/template.js';
+import { isMultilineCommand, templateSummary } from '../core/template.js';
 // Type-only: erased at compile time, so this does NOT pull the relay in.
 import type { Relay } from '../relay/index.js';
 import type { PermissionDecision, PreToolUseHookOutput, PreToolUsePayload } from '../types.js';
@@ -343,7 +343,15 @@ export class Daemon {
     // 2. Escalation. Recorded regardless of whether anyone will be told about
     // it — the log is the product, the notification is a feature.
     const summary = templateSummary(toolName, redacted);
-    logEvent({ event: 'escalation', session: identity.name, tool: toolName, fingerprint, summary });
+    const cmd = redacted.command;
+    logEvent({
+      event: 'escalation',
+      session: identity.name,
+      tool: toolName,
+      fingerprint,
+      summary,
+      ...(typeof cmd === 'string' && isMultilineCommand(cmd) ? { multiline: true } : {}),
+    });
 
     const relay = await this.relayIfEnabled();
 

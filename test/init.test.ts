@@ -166,14 +166,29 @@ describe('notification formatting', () => {
     assert.match(templateSummary('Task', { description: 'audit deps' }), /^subagent: /);
   });
 
+  it('says how much of a multi-line command it had to drop', () => {
+    // Without the tail these are indistinguishable from a bare `cd`, which is
+    // how 24 multi-line scripts came to be filed under an already-allowed rule.
+    assert.equal(
+      templateSummary('Bash', { command: 'cd ~/projects/api\nnpm test\nrm -rf build' }),
+      'run: cd ~/projects/api +2 lines',
+    );
+    assert.equal(
+      templateSummary('Bash', { command: 'cd ~/a\nls' }),
+      'run: cd ~/a +1 line',
+    );
+    // A trailing newline is not a second line.
+    assert.equal(templateSummary('Bash', { command: 'cd ~/a\n' }), 'run: cd ~/a');
+  });
+
   it('degrades gracefully for an unknown future tool', () => {
     assert.equal(templateSummary('QuantumTool', {}), 'use QuantumTool');
     assert.match(templateSummary('QuantumTool', { command: 'entangle' }), /QuantumTool: entangle/);
   });
 
-  it('truncates a multi-line command to its first line', () => {
+  it('keeps a multi-line command to its first line, and says so', () => {
     const s = templateSummary('Bash', { command: 'line one\nline two\nline three' });
-    assert.equal(s, 'run: line one');
+    assert.equal(s, 'run: line one +2 lines');
   });
 });
 
