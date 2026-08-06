@@ -14,6 +14,10 @@ import type { EventRecord } from '../types.js';
  *    summary truncated at 90 characters, so the tail of a long command is not
  *    recoverable. The head is, it is what a rule keys on anyway, and it is
  *    stable under truncation.
+ * 3. **Only score what a rule could actually match.** Truncation is safe to key
+ *    through; losing whole *lines* is not. A multi-line command is unmatchable
+ *    by any rule generated here, so it is evidence for nothing and is dropped
+ *    rather than credited to its first line. See `shapeOf`.
  */
 
 export type Safety = 'safe' | 'review' | 'unsafe';
@@ -119,12 +123,44 @@ export function commandHead(command: string): string | null {
   return first;
 }
 
-/** Recover the tool call shape from a logged event. */
+/** The ` +3 lines` tail `templateSummary` appends to a multi-line command. */
+const MULTILINE_MARKER = /\s\+\d+ lines?$/;
+
+/**
+ * The characters `GUARD` excludes. A command containing one of these cannot be
+ * matched by any rule generated here, so its first token is not its shape and
+ * crediting it to one is wrong in both directions:
+ *
+ *   - it inflates the head's count with calls the rule would never have allowed;
+ *   - it lends the head the *sensitivity* of a command that merely follows it.
+ *     `cd ~/x; cat creds/README.md` marked the whole `cd` group sensitive, which
+ *     scored `cd` unsafe and hid a 39% suggestion — until that day aged out of
+ *     the window, when the same suggestion silently reappeared.
+ *
+ * Residual: the summary is truncated at 90 characters, so a metacharacter past
+ * the cut is invisible here. Truncation is marked with `…`, so that case is
+ * detectable but not currently excluded — see `shapeOf`.
+ */
+const UNMATCHABLE = /[;&|><$`\n]/;
+
+/**
+ * Recover the tool call shape from a logged event.
+ *
+ * One rule decides this: **if no rule generated here could match the command,
+ * the command is evidence for nothing.** That covers the two ways a command
+ * stops being described by its first token — chained (`cd ~/x; cat creds`) and
+ * multi-line — and it is the same set of characters `GUARD` excludes, so the
+ * test and the rule it protects cannot drift apart.
+ */
 export function shapeOf(rec: EventRecord): { kind: 'bash' | 'tool'; shape: string } | null {
   if (rec.tool.toLowerCase() === 'bash') {
+    if (rec.multiline) return null;
     const m = /^run:\s*(.+)$/.exec(rec.summary ?? '');
     if (!m) return null;
-    const head = commandHead(m[1]!);
+    const line = m[1]!;
+    if (MULTILINE_MARKER.test(line)) return null;
+    if (UNMATCHABLE.test(line)) return null;
+    const head = commandHead(line);
     return head ? { kind: 'bash', shape: head } : null;
   }
   if (!rec.tool || rec.tool === '-') return null;
@@ -169,10 +205,43 @@ export function isSyntheticSession(session: string | undefined): boolean {
   return session !== undefined && SYNTHETIC_SESSIONS.has(session.split(':')[0]!.toLowerCase());
 }
 
+/**
+ * Summaries that provably do not determine the command behind them.
+ *
+ * `fingerprint` hashes the whole normalized command, so one command run twenty
+ * times yields one fingerprint. Two fingerprints under one summary therefore
+ * prove the summary dropped something — a second line, a truncated tail, or a
+ * redacted secret — and a shape cannot be keyed on text that lossy.
+ *
+ * This is what makes the log collected *before* multi-line commands were
+ * flagged still usable: on this machine four `cd` summaries covered 42 distinct
+ * fingerprints, every one of them a script that merely opened with `cd`.
+ *
+ * Exact in the direction that matters — it never excludes a summary that does
+ * determine its command. The residual is the reverse: an identical multi-line
+ * script repeated verbatim collapses to one fingerprint and is not caught here.
+ * Events logged since the flag exists are caught by the flag instead.
+ */
+function lossySummaries(escalations: EventRecord[]): Set<string> {
+  const seen = new Map<string, Set<string>>();
+  for (const e of escalations) {
+    if (!e.summary || !e.fingerprint) continue;
+    const fps = seen.get(e.summary) ?? new Set<string>();
+    fps.add(e.fingerprint);
+    seen.set(e.summary, fps);
+  }
+  const lossy = new Set<string>();
+  for (const [summary, fps] of seen) {
+    if (fps.size > 1) lossy.add(summary);
+  }
+  return lossy;
+}
+
 export function buildReport(events: EventRecord[], windowHours: number): SuggestReport {
   const escalations = events.filter(
     (e) => e.event === 'escalation' && !isSyntheticSession(e.session),
   );
+  const lossy = lossySummaries(escalations);
 
   // fingerprint -> final decision, so a shape can be scored on outcomes.
   const outcome = new Map<string, { decision?: string; source?: string }>();
@@ -195,6 +264,9 @@ export function buildReport(events: EventRecord[], windowHours: number): Suggest
   for (const e of escalations) {
     const s = shapeOf(e);
     if (!s) continue;
+    // Bash shapes come from the summary text; a tool shape comes from the tool
+    // name, which truncation cannot corrupt.
+    if (s.kind === 'bash' && e.summary && lossy.has(e.summary)) continue;
     const key = `${s.kind}:${s.shape}`;
     const acc = groups.get(key) ?? {
       kind: s.kind,

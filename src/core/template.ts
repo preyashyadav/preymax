@@ -16,6 +16,26 @@ function firstLine(s: string, max = 90): string {
   return line.length > max ? line.slice(0, max - 1) + '…' : line;
 }
 
+/**
+ * Does this command span more than one line?
+ *
+ * Load-bearing beyond display: a multi-line command is unmatchable by any rule
+ * `suggest` can generate, because every generated rule carries a guard that
+ * excludes `\n`. Twenty-four multi-line scripts that merely *opened* with `cd`
+ * were logged as `run: cd ~/…` — identical summaries, distinct fingerprints —
+ * and read back as evidence for a `cd` rule that would never have allowed one
+ * of them.
+ */
+export function isMultilineCommand(command: string): boolean {
+  return command.trimEnd().includes('\n');
+}
+
+/** ` +3 lines` — the part of a multi-line command the summary had to drop. */
+function moreLines(command: string): string {
+  const n = command.trimEnd().split('\n').length - 1;
+  return n > 0 ? ` +${n} line${n === 1 ? '' : 's'}` : '';
+}
+
 export function templateSummary(
   toolName: string,
   redactedInput: Record<string, unknown>,
@@ -31,7 +51,7 @@ export function templateSummary(
   switch (toolName.toLowerCase()) {
     case 'bash': {
       const cmd = str('command');
-      return cmd ? `run: ${firstLine(cmd)}` : 'run a shell command';
+      return cmd ? `run: ${firstLine(cmd)}${moreLines(cmd)}` : 'run a shell command';
     }
     case 'write':
       return short ? `write: ${short}` : 'write a file';

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildReport, commandHead, patternFor, renderRules } from '../src/insight/suggest.js';
+import { buildReport, commandHead, patternFor, renderRules, shapeOf } from '../src/insight/suggest.js';
 import { parsePolicy, evaluate } from '../src/core/policy.js';
 import type { EventRecord } from '../src/types.js';
 
@@ -212,5 +212,118 @@ describe('suggest: rules that cannot be written safely', () => {
       undefined,
     );
     assert.equal(report.suggestions.find((s) => s.shape === 'cd')?.count, 3);
+  });
+});
+
+/**
+ * The bug this guards: a multi-line script opening with `cd` was logged as
+ * `run: cd ~/…` — first line only — and read back as evidence for a `cd` rule.
+ * The rule's own guard excludes `\n`, so it could never have matched the script
+ * that argued for it. 24 of these on this machine made `cd` the top escalating
+ * call while `cd` was already auto-allowed.
+ */
+describe('suggest: multi-line commands are evidence for nothing', () => {
+  function multi(summary: string, session = 'preymax'): EventRecord {
+    return {
+      ts: new Date().toISOString(),
+      event: 'escalation',
+      session,
+      tool: 'Bash',
+      summary,
+      multiline: true,
+      fingerprint: `ml-${summary}-${Math.random()}`,
+    };
+  }
+
+  it('does not credit a multi-line script to its first line', () => {
+    const events = [
+      ...Array.from({ length: 24 }, () => multi('run: cd ~/projects/api +3 lines')),
+      ...Array.from({ length: 2 }, () => esc('Bash', 'run: cd /tmp')),
+    ];
+    const report = buildReport(events, 24);
+    assert.equal(report.suggestions.find((s) => s.shape === 'cd')?.count, 2);
+  });
+
+  it('still counts them as escalations — they happened', () => {
+    const report = buildReport([multi('run: cd ~/a +2 lines')], 24);
+    assert.equal(report.escalations, 1);
+    assert.equal(report.suggestions.length, 0);
+  });
+
+  it('falls back to the summary marker when the event predates the flag', () => {
+    const stale: EventRecord = {
+      ts: new Date().toISOString(),
+      event: 'escalation',
+      session: 'preymax',
+      tool: 'Bash',
+      summary: 'run: cd ~/projects/api +3 lines',
+      fingerprint: 'no-flag',
+    };
+    assert.equal(shapeOf(stale), null);
+  });
+
+  it('leaves ordinary single-line commands alone', () => {
+    assert.deepEqual(shapeOf(esc('Bash', 'run: git status --short')), {
+      kind: 'bash',
+      shape: 'git status',
+    });
+  });
+
+  it('does not credit a chained command to its first token', () => {
+    const events = [
+      ...Array.from({ length: 5 }, () =>
+        esc('Bash', 'run: cd ~/x; cat tago-server/credentials/README.md'),
+      ),
+      ...Array.from({ length: 2 }, () => esc('Bash', 'run: cd /tmp')),
+    ];
+    const report = buildReport(events, 24);
+    assert.equal(report.suggestions.find((s) => s.shape === 'cd')?.count, 2);
+  });
+
+  it('does not let a chained command lend its sensitivity to the head', () => {
+    // The regression: one `cd ~/x; cat creds` scored the whole `cd` group
+    // unsafe and hid it, then un-hid it when that day left the window.
+    const report = buildReport(
+      [
+        esc('Bash', 'run: cd ~/x; cat ~/.aws/credentials'),
+        ...Array.from({ length: 9 }, () => esc('Bash', 'run: cd /tmp')),
+      ],
+      24,
+    );
+    const cd = report.suggestions.find((s) => s.shape === 'cd');
+    assert.equal(cd?.count, 9);
+    assert.equal(cd?.safety, 'safe');
+  });
+
+  it('still marks a head unsafe when the head itself touched a secret', () => {
+    const report = buildReport(
+      [esc('Bash', 'run: cat ~/.ssh/id_rsa'), esc('Bash', 'run: cat [redacted]')],
+      24,
+    );
+    assert.equal(report.suggestions.find((s) => s.shape === 'cat')?.safety, 'unsafe');
+  });
+
+  it('drops a summary that two different commands both produced', () => {
+    // Pre-flag history: identical first line, distinct fingerprints. One
+    // command run twice would share a fingerprint; these cannot be the same
+    // command, so the summary does not identify what a rule would allow.
+    const events = [
+      esc('Bash', 'run: cd ~/api', 's1', 'fp-a'),
+      esc('Bash', 'run: cd ~/api', 's1', 'fp-b'),
+      esc('Bash', 'run: cd ~/api', 's1', 'fp-c'),
+      esc('Bash', 'run: cd /tmp', 's1', 'fp-same'),
+      esc('Bash', 'run: cd /tmp', 's1', 'fp-same'),
+    ];
+    const report = buildReport(events, 24);
+    // Only the genuinely-repeated single-line command counts.
+    assert.equal(report.suggestions.find((s) => s.shape === 'cd')?.count, 2);
+    assert.equal(report.escalations, 5);
+  });
+
+  it('never generates a rule that matches a multi-line command', () => {
+    const policy = parsePolicy(`auto_allow:\n  - tool: Bash\n    command_matches:\n      - '${patternFor('bash', 'cd')}'\n`);
+    const script = 'cd ~/projects/api\nnpm test\nrm -rf build';
+    assert.equal(evaluate(policy, 'Bash', { command: script }).bucket, 'escalate');
+    assert.equal(evaluate(policy, 'Bash', { command: 'cd ~/projects/api' }).bucket, 'auto_allow');
   });
 });

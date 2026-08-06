@@ -101,5 +101,12 @@ export interface EventRecord {
   latencyMs?: number;
   fingerprint?: string;
   summary?: string;
+  /**
+   * The command spanned more than one line, so `summary` shows only its first.
+   * Recorded because no generated rule can ever match a multi-line command —
+   * the guard excludes `\n` — so keying a suggestion on the first line counts
+   * evidence toward a rule that would not have fired. See `shapeOf`.
+   */
+  multiline?: boolean;
   detail?: string;
 }
