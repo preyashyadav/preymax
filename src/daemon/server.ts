@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import type { Config } from '../core/config.js';
+import { bindsTailnet, relayActive, type Config } from '../core/config.js';
 import { resolveIdentity } from '../core/identity.js';
 import { logEvent } from '../log/events.js';
 import { evaluate, loadPolicy, type Policy } from '../core/policy.js';
@@ -81,7 +81,7 @@ export class Daemon {
    * there is no blocking-wait machinery to accidentally await.
    */
   private async relayIfEnabled(): Promise<Relay | null> {
-    if (!this.cfg.relay.enabled || this.cfg.shadow) return null;
+    if (!relayActive(this.cfg)) return null;
     if (this.relay) return this.relay;
     if (!this.relayLoading) {
       this.relayLoading = import('../relay/index.js').then(({ loadRelay }) =>
@@ -93,7 +93,10 @@ export class Daemon {
   }
 
   async start(): Promise<DaemonHandle> {
-    const { addresses, tailnet } = resolveBindAddresses(this.cfg.bindTailnet);
+    // The tailnet address exists so a phone can reach the daemon; with the
+    // relay off there is no phone, and `/hook` answering out there is more
+    // surface than the config asked for. See `bindsTailnet`.
+    const { addresses, tailnet } = resolveBindAddresses(bindsTailnet(this.cfg));
     // Throws before any listener opens if a non-loopback, non-tailnet address
     // is in the list. This is the assertion Phase 5 requires.
     assertSafeBind(addresses);

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_POLICY_YAML, evaluate, parsePolicy } from '../src/core/policy.js';
+import { DEFAULT_POLICY_YAML, evaluate, parsePolicy, type Policy } from '../src/core/policy.js';
 
 const policy = parsePolicy(DEFAULT_POLICY_YAML);
 
@@ -159,5 +159,42 @@ describe('matching semantics', () => {
     const p = parsePolicy("auto_allow:\n  - tool: Write\n    path_matches: ['\\.md$']\n");
     assert.equal(evaluate(p, 'Write', { file_path: '/app/README.md' }).bucket, 'auto_allow');
     assert.equal(evaluate(p, 'Write', { file_path: '/app/index.ts' }).bucket, 'escalate');
+  });
+});
+
+describe('a path rule is matched against the path the write lands on', () => {
+  /**
+   * A generated path rule is a directory prefix, and a prefix is only as good
+   * as the string it is matched against. These are `pathOf`'s three refusals,
+   * tested through a rule with *no* guard on it — the guard is defence in
+   * depth, and the floor has to hold without it.
+   */
+  const prefix = (dir: string): Policy =>
+    parsePolicy(`auto_allow:\n  - tool: Edit\n    path_matches: ['^${dir}/']\n`);
+
+  it('resolves .. before matching, so a prefix cannot be traversed out of', () => {
+    const p = prefix('/work/api');
+    assert.equal(evaluate(p, 'Edit', { file_path: '/work/api/src/a.ts' }).bucket, 'auto_allow');
+    // Lexically inside `/work/api/`, actually in a sibling project.
+    assert.equal(evaluate(p, 'Edit', { file_path: '/work/api/../other/a.ts' }).bucket, 'escalate');
+  });
+
+  it('never matches a relative path', () => {
+    // The daemon's cwd is not the session's, so there is nothing here that
+    // could resolve one correctly and a wrong resolution matches the wrong file.
+    assert.equal(evaluate(prefix('/work/api'), 'Edit', { file_path: 'src/a.ts' }).bucket, 'escalate');
+  });
+
+  it('never matches a secret-bearing path, wherever it sits', () => {
+    // Inside a directory you work in every day, and still not something any
+    // rule may allow. This floor is not liftable by a hand-written rule.
+    const p = prefix('/work/api');
+    for (const f of ['.env', '.env.production', '.npmrc', 'config/credentials', '.ssh/id_ed25519']) {
+      assert.equal(
+        evaluate(p, 'Edit', { file_path: `/work/api/${f}` }).bucket,
+        'escalate',
+        `${f} must never match a path rule`,
+      );
+    }
   });
 });

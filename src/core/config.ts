@@ -170,6 +170,36 @@ export function saveConfig(cfg: Config): void {
   chmodSync(paths.config(), 0o600);
 }
 
+/**
+ * Is the notification/approval subsystem actually going to run?
+ *
+ * One predicate, because two decisions depend on it and they must not drift:
+ * whether `relay/` is imported at all, and whether the daemon binds the tailnet
+ * address. They had already drifted. `bindTailnet` defaults to true and was read
+ * on its own, so a daemon with `relay.enabled: false` bound the tailnet address
+ * anyway whenever Tailscale happened to be up — confirmed by `lsof` on
+ * 2026-08-05. Nothing there could execute anything (`/approve` 409s with the
+ * relay off), but `/hook` answered on an address nobody had chosen to expose,
+ * and M7 is precisely the step that starts Tailscale.
+ *
+ * The tailnet bind exists to let a phone reach the daemon. With no relay there
+ * is no phone, so there is nothing for it to buy.
+ */
+export function relayActive(cfg: Config): boolean {
+  return cfg.relay.enabled && !cfg.shadow;
+}
+
+/**
+ * Should the daemon listen on the tailnet address as well as loopback?
+ *
+ * `bindTailnet` stays a preference rather than a decision, so a `relay disable`
+ * followed by a `relay enable` restores what the user asked for. The decision
+ * is this function, and it is the only thing `start()` reads.
+ */
+export function bindsTailnet(cfg: Config): boolean {
+  return cfg.bindTailnet && relayActive(cfg);
+}
+
 export function generateSecret(): string {
   return randomBytes(32).toString('hex');
 }

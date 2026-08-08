@@ -5,7 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeApproval, sign, verify, newNonce } from '../src/core/hmac.js';
 import { PendingStore } from '../src/relay/pending.js';
-import { assertSafeBind, isTailscaleAddress, UnsafeBindError } from '../src/daemon/net.js';
+import {
+  assertSafeBind,
+  isTailscaleAddress,
+  resolveBindAddresses,
+  UnsafeBindError,
+} from '../src/daemon/net.js';
+import { bindsTailnet, DEFAULT_CONFIG, type Config } from '../src/core/config.js';
 import type { SessionIdentity } from '../src/types.js';
 
 /**
@@ -223,5 +229,46 @@ describe('network binding', () => {
     // 100.0.0.0/8 outside 64-127 is ordinary public space, not Tailscale.
     assert.equal(isTailscaleAddress('100.63.0.1'), false);
     assert.equal(isTailscaleAddress('100.128.0.1'), false);
+  });
+});
+
+describe('the tailnet bind is gated on the relay', () => {
+  /**
+   * `bindTailnet` defaults to true, and until 2026-08-06 it was read on its
+   * own: a daemon with the relay off bound the tailnet address anyway whenever
+   * Tailscale happened to be up, and answered `/hook` there. The loopback-only
+   * line in the handoff was true by luck — the interface was down when that
+   * daemon started.
+   *
+   * The decision is asserted here rather than through a live daemon on purpose.
+   * A daemon test on this machine passes with the bug present, because there is
+   * no tailnet address to find while Tailscale is stopped, which is exactly the
+   * accident that hid it.
+   */
+  const cfg = (patch: Partial<Config>): Config => ({ ...DEFAULT_CONFIG, ...patch });
+
+  it('does not bind the tailnet while the relay is off', () => {
+    const c = cfg({ bindTailnet: true, relay: { enabled: false } });
+    assert.equal(bindsTailnet(c), false);
+    assert.deepEqual(resolveBindAddresses(bindsTailnet(c)).addresses, ['127.0.0.1']);
+  });
+
+  it('does not bind the tailnet in shadow mode, relay flag notwithstanding', () => {
+    // Shadow mode never constructs the relay, so nothing on the tailnet could
+    // be answered by it. Same condition as `relayIfEnabled`, one predicate.
+    assert.equal(bindsTailnet(cfg({ bindTailnet: true, relay: { enabled: true }, shadow: true })), false);
+  });
+
+  it('binds the tailnet only when asked for and the relay is live', () => {
+    assert.equal(bindsTailnet(cfg({ bindTailnet: true, relay: { enabled: true } })), true);
+    assert.equal(bindsTailnet(cfg({ bindTailnet: false, relay: { enabled: true } })), false);
+  });
+
+  it('keeps bindTailnet as a preference the relay flag does not overwrite', () => {
+    // A `relay disable` must not clear it, so `relay enable` restores what the
+    // user originally asked for rather than silently downgrading them.
+    const c = cfg({ bindTailnet: true, relay: { enabled: false } });
+    assert.equal(c.bindTailnet, true);
+    assert.equal(bindsTailnet({ ...c, relay: { enabled: true } }), true);
   });
 });

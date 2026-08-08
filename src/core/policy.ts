@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { normalize } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { paths } from './paths.js';
+import { isSensitivePath } from './redact.js';
 
 /**
  * The policy engine exists to cut escalation volume, not to provide security.
@@ -27,7 +29,10 @@ export interface Rule {
   tool?: string | string[];
   /** Regexes tested against the Bash command string. */
   command_matches?: string[];
-  /** Regexes tested against the file path (Write/Edit/Read). */
+  /**
+   * Regexes tested against the normalized absolute file path (Write/Edit/Read).
+   * See `pathOf` for what a rule written here can and cannot assume.
+   */
   path_matches?: string[];
   /** Shown to Claude as permissionDecisionReason on a deny. */
   reason?: string;
@@ -152,10 +157,31 @@ export function commandOf(toolName: string, input: Record<string, unknown>): str
   return typeof c === 'string' ? c : null;
 }
 
+/**
+ * Pull the path a `path_matches` rule is tested against, normalized.
+ *
+ * Three things happen here and all three are load-bearing, because a generated
+ * path rule is a *directory prefix* and a prefix is only as good as the string
+ * it is matched against:
+ *
+ *  - **`..` is resolved first.** `<project>/../../.ssh/authorized_keys` carries
+ *    `<project>/` as a literal prefix while pointing nowhere near it. Matching
+ *    the raw string would allow the write; matching the normalized one does not.
+ *  - **A relative path never matches.** The daemon's cwd is not the session's,
+ *    so nothing here can resolve one correctly, and a wrong resolution is how a
+ *    prefix rule ends up matching the wrong file. Returning null escalates.
+ *  - **A sensitive path never matches**, wherever it sits. A `.env` or an
+ *    `.ssh/` key inside a directory you work in every day is still not
+ *    something a mined suggestion should ever have allowed. This is a floor a
+ *    hand-written rule cannot lift, which is deliberate.
+ */
 export function pathOf(input: Record<string, unknown>): string | null {
   for (const k of ['file_path', 'path', 'notebook_path']) {
     const v = input[k];
-    if (typeof v === 'string') return v;
+    if (typeof v !== 'string' || v === '') continue;
+    if (!v.startsWith('/')) return null;
+    const resolved = normalize(v);
+    return isSensitivePath(resolved) ? null : resolved;
   }
   return null;
 }

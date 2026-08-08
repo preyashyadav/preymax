@@ -1,3 +1,4 @@
+import { expandHome, isSensitivePath } from '../core/redact.js';
 import type { EventRecord } from '../types.js';
 
 /**
@@ -18,17 +19,30 @@ import type { EventRecord } from '../types.js';
  *    through; losing whole *lines* is not. A multi-line command is unmatchable
  *    by any rule generated here, so it is evidence for nothing and is dropped
  *    rather than credited to its first line. See `shapeOf`.
+ *
+ * Three rule forms come out of this: a Bash `command_matches` rule, a whole-tool
+ * rule, and — for writers, which can never have either — a **path-scoped** rule
+ * naming the directory the log shows that session working in. See `commonScope`.
  */
 
 export type Safety = 'safe' | 'review' | 'unsafe';
 
+/**
+ * `bash` — a `command_matches` rule. `tool` — a whole-tool rule. `path` — a
+ * writer tool scoped to a directory you demonstrably work in.
+ */
+export type Kind = 'bash' | 'tool' | 'path';
+
 export interface Suggestion {
-  /** Human label, e.g. `cd` or `git status`. */
+  /** Human label, e.g. `cd`, `git status`, or `~/code/api` for a path scope. */
   shape: string;
   /** The rule this would add. */
   pattern: string;
-  /** Bash command rule, or a whole-tool rule. */
-  kind: 'bash' | 'tool';
+  kind: Kind;
+  /** For `path`: the writer tools actually observed inside that directory. */
+  tools?: string[];
+  /** What to print in the report — a path pattern is too long to read raw. */
+  label: string;
   count: number;
   share: number;
   safety: Safety;
@@ -74,14 +88,43 @@ const SAFE_TOOLS = new Set([
 ]);
 
 /**
- * Tools with no safe whole-tool rule. `policy.yaml` matches tools by name and
- * Bash by command; there is no per-path form, so the only rule that can be
- * written for `Edit` is *every edit, anywhere*. Suggesting one as `review` was
- * not a smaller version of that — `--include-review` applied it verbatim, and
- * this machine spent a day auto-allowing writes to `~/.ssh/authorized_keys`.
- * Until a path-scoped rule exists, these are never suggested at any level.
+ * Tools that write files. A *whole-tool* rule for one of these says "every edit,
+ * anywhere" — there is no smaller version of it, which is why suggesting one as
+ * `review` was wrong: `--include-review` applied it verbatim and this machine
+ * spent a day auto-allowing writes to `~/.ssh/authorized_keys`.
+ *
+ * They are still never suggested as a whole-tool rule. What they get instead is
+ * a **path-scoped** rule — the same tool, restricted to a directory the log
+ * shows you working in — which *is* a smaller version, and is what the day-6
+ * reading identified as the one change with evidence behind it: 18 of 125
+ * escalations were `Edit`, unaddressable by any rule the suggester could write.
  */
-const UNSCOPABLE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit']);
+const WRITER_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'MultiEdit']);
+
+/**
+ * Directories a scope may never start with, whatever the log shows. Depth alone
+ * does not make `~/Library/Application Support/...` a project directory.
+ */
+const NEVER_SCOPE = new Set([
+  'Library', 'System', 'Applications', 'Volumes', 'private', 'usr', 'bin',
+  'sbin', 'etc', 'var', 'dev', 'opt', 'tmp',
+]);
+
+/**
+ * The path analogue of `GUARD`, and it exists for the same reason: a bare
+ * directory prefix is not safe on its own.
+ *
+ * Every segment below the scope must be a normal name — no segment may start
+ * with a dot. That excludes `.git/hooks/pre-commit` (executable code), `.env`,
+ * and any `..` that survived normalization, all of which sit inside a directory
+ * you legitimately work in. The cost is that editing `.gitignore` still
+ * escalates, which is the right side to err on for a rule that authorizes
+ * writes.
+ */
+const PATH_GUARD = '(?:[^./][^/]*/)*[^./][^/]*$';
+
+/** How many directory levels below `~` (or `/`) a scope must reach. */
+const MIN_SCOPE_DEPTH = 2;
 
 /**
  * Sessions that generate load rather than doing work. Benchmarks hit the same
@@ -167,6 +210,96 @@ export function shapeOf(rec: EventRecord): { kind: 'bash' | 'tool'; shape: strin
   return { kind: 'tool', shape: rec.tool };
 }
 
+/** `edit: ~/code/api/src/x.ts` -> `~/code/api/src/x.ts`. */
+const WRITE_SUMMARY = /^(?:write|edit|edit notebook):\s*(.+)$/;
+
+/**
+ * The path a writer escalation targeted, or null if the log does not determine
+ * it. Truncated summaries are refused for the same reason multi-line commands
+ * are: `…` means the tail is gone, and the tail of a path is the file.
+ */
+export function writePathOf(rec: EventRecord): string | null {
+  if (!WRITER_TOOLS.has(rec.tool)) return null;
+  const m = WRITE_SUMMARY.exec(rec.summary ?? '');
+  if (!m) return null;
+  const path = m[1]!.trim();
+  if (path.endsWith('…') || path === '') return null;
+  if (!path.startsWith('~/') && !path.startsWith('/')) return null;
+  return path;
+}
+
+/** The directory segments of a file path, e.g. `~/a/b/c.ts` -> `['~','a','b']`. */
+function dirSegments(path: string): string[] {
+  return path.split('/').slice(0, -1);
+}
+
+/**
+ * The deepest directory that contains every path in the group.
+ *
+ * One scope per session, derived rather than configured: the log already knows
+ * where you work, and asking the user to name a directory would make this a
+ * setting rather than a suggestion. Sessions that touched two unrelated trees
+ * collapse to their common ancestor, which `scopeIsUsable` then rejects for
+ * being too shallow — the correct outcome, since no single rule describes that
+ * session honestly.
+ */
+export function commonScope(paths: string[]): string | null {
+  if (paths.length === 0) return null;
+  let common = dirSegments(paths[0]!);
+  for (const p of paths.slice(1)) {
+    const other = dirSegments(p);
+    let i = 0;
+    while (i < common.length && i < other.length && common[i] === other[i]) i++;
+    common = common.slice(0, i);
+  }
+  return common.length > 0 ? common.join('/') : null;
+}
+
+/**
+ * Is this directory specific enough to authorize writes inside?
+ *
+ * Rejects, in order: anything not rooted at `~` or `/`; a scope that does not
+ * reach `MIN_SCOPE_DEPTH` levels down, which is how `~` and `~/Documents` are
+ * kept out; a dotted segment, which is how `~/.ssh` and `~/.claude` are; and
+ * the system directories in `NEVER_SCOPE`.
+ */
+export function scopeIsUsable(scope: string | null): boolean {
+  if (!scope) return false;
+  const segs = scope.split('/');
+  const root = segs[0];
+  if (root !== '~' && root !== '') return false;
+  const below = segs.slice(1);
+  if (below.length < MIN_SCOPE_DEPTH) return false;
+  if (below.some((s) => s === '' || s.startsWith('.'))) return false;
+  if (NEVER_SCOPE.has(below[0]!)) return false;
+  return true;
+}
+
+/**
+ * Path scopes are never `safe`.
+ *
+ * `safe` means "applied without you reading it". A rule that authorizes writes
+ * inside a directory is not that, however narrow the directory, and no amount
+ * of repetition in the log makes it that. The ceiling here is `review`, which
+ * is the whole difference between this and the rule that auto-allowed every
+ * write on this machine.
+ */
+function scorePath(
+  scope: string | null,
+  denied: number,
+  sensitive: boolean,
+): { safety: Safety; reason: string } {
+  if (denied > 0) return { safety: 'unsafe', reason: `denied ${denied}× — never suggested` };
+  if (sensitive) return { safety: 'unsafe', reason: 'touched a secret-bearing path' };
+  if (!scopeIsUsable(scope)) {
+    return {
+      safety: 'unsafe',
+      reason: 'no directory narrow enough to scope to — never suggested',
+    };
+  }
+  return { safety: 'review', reason: `writes, scoped to ${scope}/` };
+}
+
 function scoreBash(
   head: string,
   denied: number,
@@ -184,19 +317,27 @@ function scoreBash(
 function scoreTool(tool: string, denied: number): { safety: Safety; reason: string } {
   if (denied > 0) return { safety: 'unsafe', reason: `denied ${denied}× — never suggested` };
   if (SAFE_TOOLS.has(tool)) return { safety: 'safe', reason: 'interaction or read-only tool' };
-  if (UNSCOPABLE_TOOLS.has(tool)) {
+  if (WRITER_TOOLS.has(tool)) {
     return {
       safety: 'unsafe',
-      reason: 'writes files, and a tool rule cannot be scoped to a path — never suggested',
+      reason: 'writes files, and this group has no path to scope to — never suggested',
     };
   }
   return { safety: 'review', reason: 'unrecognised tool' };
 }
 
-export function patternFor(kind: 'bash' | 'tool', shape: string): string {
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function patternFor(kind: Kind, shape: string): string {
   if (kind === 'tool') return shape;
+  if (kind === 'path') {
+    // The log stores collapsed paths; the engine matches the real one.
+    return `^${escapeRegex(expandHome(shape))}/${PATH_GUARD}`;
+  }
   // Escape regex metacharacters in the head, then anchor and guard.
-  const escaped = shape.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+');
+  const escaped = escapeRegex(shape).replace(/ /g, '\\s+');
   return `^${escaped}\\b${GUARD}`;
 }
 
@@ -237,11 +378,44 @@ function lossySummaries(escalations: EventRecord[]): Set<string> {
   return lossy;
 }
 
+/**
+ * Assign each writer escalation the directory its session works in.
+ *
+ * Writers group by directory, not by tool name, and the scope needs every path
+ * in the session at once — so it is derived here, before the grouping loop,
+ * which then just looks each event up.
+ *
+ * A sensitive path is dropped rather than counted: `pathOf` refuses to match
+ * one at decide time, so a `.env` edit is not evidence for a rule that would
+ * never have allowed it. Those events fall through to the whole-tool grouping
+ * and stay visible in the report as unsuggestible, which is what they are.
+ */
+function deriveScopes(escalations: EventRecord[]): Map<EventRecord, string> {
+  const bySession = new Map<string, Array<{ rec: EventRecord; path: string }>>();
+  for (const e of escalations) {
+    const path = writePathOf(e);
+    if (!path || isSensitivePath(path)) continue;
+    const list = bySession.get(e.session) ?? [];
+    list.push({ rec: e, path });
+    bySession.set(e.session, list);
+  }
+
+  const scopes = new Map<EventRecord, string>();
+  for (const list of bySession.values()) {
+    const scope = commonScope(list.map((x) => x.path));
+    // An unusable scope is still assigned, so the group exists and the report
+    // says *why* it cannot be suggested rather than dropping it silently.
+    if (scope) for (const { rec } of list) scopes.set(rec, scope);
+  }
+  return scopes;
+}
+
 export function buildReport(events: EventRecord[], windowHours: number): SuggestReport {
   const escalations = events.filter(
     (e) => e.event === 'escalation' && !isSyntheticSession(e.session),
   );
   const lossy = lossySummaries(escalations);
+  const scopeOf = deriveScopes(escalations);
 
   // fingerprint -> final decision, so a shape can be scored on outcomes.
   const outcome = new Map<string, { decision?: string; source?: string }>();
@@ -252,9 +426,10 @@ export function buildReport(events: EventRecord[], windowHours: number): Suggest
   }
 
   interface Acc {
-    kind: 'bash' | 'tool';
+    kind: Kind;
     count: number;
     sessions: Set<string>;
+    tools: Set<string>;
     approved: number;
     denied: number;
     sensitive: boolean;
@@ -262,22 +437,26 @@ export function buildReport(events: EventRecord[], windowHours: number): Suggest
   const groups = new Map<string, Acc>();
 
   for (const e of escalations) {
-    const s = shapeOf(e);
+    const scope = scopeOf.get(e);
+    const s = scope ? ({ kind: 'path', shape: scope } as const) : shapeOf(e);
     if (!s) continue;
-    // Bash shapes come from the summary text; a tool shape comes from the tool
-    // name, which truncation cannot corrupt.
+    // Bash shapes come from the summary text; a tool or path shape comes from
+    // the tool name and a path the summary carried whole, neither of which a
+    // truncated tail can corrupt.
     if (s.kind === 'bash' && e.summary && lossy.has(e.summary)) continue;
     const key = `${s.kind}:${s.shape}`;
     const acc = groups.get(key) ?? {
       kind: s.kind,
       count: 0,
       sessions: new Set<string>(),
+      tools: new Set<string>(),
       approved: 0,
       denied: 0,
       sensitive: false,
     };
     acc.count++;
     acc.sessions.add(e.session);
+    acc.tools.add(e.tool);
     if (SENSITIVE.test(e.summary ?? '')) acc.sensitive = true;
 
     const o = e.fingerprint ? outcome.get(e.fingerprint) : undefined;
@@ -297,11 +476,17 @@ export function buildReport(events: EventRecord[], windowHours: number): Suggest
     const { safety, reason } =
       acc.kind === 'bash'
         ? scoreBash(shape, acc.denied, acc.sensitive)
-        : scoreTool(shape, acc.denied);
+        : acc.kind === 'path'
+          ? scorePath(shape, acc.denied, acc.sensitive)
+          : scoreTool(shape, acc.denied);
+    const tools = acc.kind === 'path' ? [...acc.tools].sort() : undefined;
+    const pattern = patternFor(acc.kind, shape);
     suggestions.push({
       shape,
       kind: acc.kind,
-      pattern: patternFor(acc.kind, shape),
+      tools,
+      pattern,
+      label: tools ? `${tools.join(', ')} in ${shape}/` : pattern,
       count: acc.count,
       share: total ? acc.count / total : 0,
       safety,
@@ -327,10 +512,14 @@ export function buildReport(events: EventRecord[], windowHours: number): Suggest
  * rule is auditable and revertable.
  */
 export function renderRules(picked: Suggestion[], now = new Date()): string {
+  // Last line of defence before this reaches the file that decides what runs
+  // without asking: an unusable scope never renders, whatever scored it.
+  picked = picked.filter((s) => s.kind !== 'path' || scopeIsUsable(s.shape));
   if (picked.length === 0) return '';
   const stamp = now.toISOString().slice(0, 10);
   const bash = picked.filter((s) => s.kind === 'bash');
   const tools = picked.filter((s) => s.kind === 'tool');
+  const scoped = picked.filter((s) => s.kind === 'path');
 
   const lines: string[] = ['', `  # suggested by preymax on ${stamp}`];
   if (tools.length > 0) {
@@ -347,6 +536,14 @@ export function renderRules(picked: Suggestion[], now = new Date()): string {
       lines.push(`      # ${s.shape} — ${s.count} observations, ${s.reason}`);
       lines.push(`      - '${s.pattern}'`);
     }
+  }
+  // One rule per scope: each carries its own tool list, and merging two
+  // directories under one rule would silently widen both.
+  for (const s of scoped) {
+    lines.push(`  - tool: [${(s.tools ?? []).join(', ')}]`);
+    lines.push(`    # ${s.shape}/ — ${s.count} observations, ${s.reason}`);
+    lines.push('    path_matches:');
+    lines.push(`      - '${s.pattern}'`);
   }
   return lines.join('\n') + '\n';
 }

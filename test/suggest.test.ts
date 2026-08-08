@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { homedir } from 'node:os';
 import { buildReport, commandHead, patternFor, renderRules, shapeOf } from '../src/insight/suggest.js';
 import { parsePolicy, evaluate } from '../src/core/policy.js';
 import type { EventRecord } from '../src/types.js';
@@ -325,5 +326,148 @@ describe('suggest: multi-line commands are evidence for nothing', () => {
     const script = 'cd ~/projects/api\nnpm test\nrm -rf build';
     assert.equal(evaluate(policy, 'Bash', { command: script }).bucket, 'escalate');
     assert.equal(evaluate(policy, 'Bash', { command: 'cd ~/projects/api' }).bucket, 'auto_allow');
+  });
+});
+
+describe('writers get a path-scoped rule, or none at all', () => {
+  /**
+   * 18 of 125 escalations in the day-6 reading were `Edit`, and not one was
+   * addressable: a whole-tool rule for a writer says "every edit, anywhere",
+   * and `--include-review` once applied exactly that. The scoped form is the
+   * smaller version that was missing. These tests are about the boundary of
+   * what it may scope to, not about finding more of them.
+   */
+  const home = homedir();
+  const project = `~/code/api`;
+
+  function edit(file: string, session = 's1', fingerprint?: string): EventRecord {
+    return esc('Edit', `edit: ${file}`, session, fingerprint);
+  }
+
+  it('scopes to the directory containing everything the session edited', () => {
+    const report = buildReport(
+      [
+        edit(`${project}/src/index.ts`),
+        edit(`${project}/src/db/pool.ts`),
+        edit(`${project}/test/index.test.ts`),
+      ],
+      24,
+    );
+    const s = report.suggestions.find((x) => x.kind === 'path');
+    assert.equal(s?.shape, project);
+    assert.equal(s?.count, 3);
+    assert.deepEqual(s?.tools, ['Edit']);
+  });
+
+  it('never scores a path scope safe, however much repetition there is', () => {
+    const events = Array.from({ length: 200 }, (_, i) => edit(`${project}/src/f${i}.ts`));
+    const s = buildReport(events, 24).suggestions.find((x) => x.kind === 'path');
+    // `safe` means applied without reading it. Authorizing writes is not that.
+    assert.equal(s?.safety, 'review');
+  });
+
+  it('refuses a scope that is not a project directory', () => {
+    for (const file of [
+      '~/notes.md',                      // home root
+      '~/Documents/notes.md',            // one level down
+      '~/.ssh/authorized_keys',          // dotted
+      '~/Library/Preferences/x.plist',   // system
+      '/etc/hosts',
+    ]) {
+      const s = buildReport([edit(file), edit(file)], 24).suggestions.find(
+        (x) => x.kind === 'path',
+      );
+      assert.equal(s?.safety ?? 'unsafe', 'unsafe', `${file} must not be scopable`);
+    }
+  });
+
+  it('collapses a session that edited two unrelated trees to nothing usable', () => {
+    // Their common ancestor is `~`, which is not a scope. One rule cannot
+    // describe this session honestly, so it gets none.
+    const s = buildReport([edit('~/code/api/a.ts'), edit('~/other/thing/b.ts')], 24).suggestions.find(
+      (x) => x.kind === 'path',
+    );
+    assert.equal(s?.safety ?? 'unsafe', 'unsafe');
+  });
+
+  it('drops a secret-bearing path from the evidence instead of widening on it', () => {
+    const report = buildReport(
+      [edit(`${project}/src/a.ts`), edit(`${project}/src/b.ts`), edit(`${project}/.env`)],
+      24,
+    );
+    const scoped = report.suggestions.find((x) => x.kind === 'path');
+    assert.equal(scoped?.count, 2);
+    // The .env edit is still visible, as an unsuggestible whole-tool group.
+    assert.equal(report.suggestions.find((x) => x.kind === 'tool')?.safety, 'unsafe');
+  });
+
+  it('will not scope on a truncated path', () => {
+    // `templateSummary` cuts at 90 chars and marks it. The tail of a path is
+    // the file, so a cut path does not say where the write landed.
+    const long = `${project}/src/${'a'.repeat(80)}…`;
+    const s = buildReport([edit(long), edit(long)], 24).suggestions.find((x) => x.kind === 'path');
+    assert.equal(s, undefined);
+  });
+
+  it('is refused entirely once a write in that scope was denied', () => {
+    const events = [
+      edit(`${project}/src/a.ts`, 's1', 'fp1'),
+      edit(`${project}/src/b.ts`, 's1', 'fp2'),
+      decided('fp2', 'deny', 'local'),
+    ];
+    const s = buildReport(events, 24).suggestions.find((x) => x.kind === 'path');
+    assert.equal(s?.safety, 'unsafe');
+  });
+
+  it('generates a rule that allows the project and nothing above or beside it', () => {
+    const report = buildReport(
+      [edit(`${project}/src/a.ts`), edit(`${project}/test/b.ts`)],
+      24,
+    );
+    const s = report.suggestions.find((x) => x.kind === 'path')!;
+    const policy = parsePolicy(renderRules([s]).replace(/^/, 'auto_allow:\n'));
+    const allows = (p: string): boolean =>
+      evaluate(policy, 'Edit', { file_path: p }).bucket === 'auto_allow';
+
+    assert.equal(allows(`${home}/code/api/src/a.ts`), true);
+    assert.equal(allows(`${home}/code/api/deep/er/c.ts`), true);
+    // Above it, beside it, and out of it the long way round.
+    assert.equal(allows(`${home}/code/other/a.ts`), false);
+    assert.equal(allows(`${home}/code/api-secrets/a.ts`), false);
+    assert.equal(allows(`${home}/code/api/../../.ssh/authorized_keys`), false);
+    // Dotted segments below the scope: `.git/hooks` is executable code.
+    assert.equal(allows(`${home}/code/api/.git/hooks/pre-commit`), false);
+    assert.equal(allows(`${home}/code/api/.env`), false);
+    // A relative path cannot be resolved by the daemon, so it never matches.
+    assert.equal(allows('src/a.ts'), false);
+  });
+
+  it('does not lend the scope to a tool that was never seen writing there', () => {
+    const report = buildReport([edit(`${project}/a.ts`), edit(`${project}/b.ts`)], 24);
+    const s = report.suggestions.find((x) => x.kind === 'path')!;
+    const policy = parsePolicy(renderRules([s]).replace(/^/, 'auto_allow:\n'));
+    assert.equal(evaluate(policy, 'Edit', { file_path: `${home}/code/api/a.ts` }).bucket, 'auto_allow');
+    assert.equal(evaluate(policy, 'Write', { file_path: `${home}/code/api/a.ts` }).bucket, 'escalate');
+  });
+
+  it('renders nothing for a scope that could not be used', () => {
+    // Defence in depth: renderRules writes the file that decides what runs.
+    const bogus: Parameters<typeof renderRules>[0] = [
+      {
+        shape: '~',
+        kind: 'path',
+        tools: ['Edit'],
+        pattern: patternFor('path', '~'),
+        label: 'Edit in ~/',
+        count: 99,
+        share: 1,
+        safety: 'review',
+        reason: 'forced',
+        sessions: 1,
+        approved: 99,
+        denied: 0,
+      },
+    ];
+    assert.equal(renderRules(bogus), '');
   });
 });

@@ -33,7 +33,7 @@ VS Code terminals "api" "web" "infra"
      1. resolve session identity
      2. policy engine → allow / deny / escalate
      3. redact
-     4. summarize (template, or Haiku within an 800ms budget)
+     4. summarize (template, or Haiku within a 2s budget)
      5. push notification
      6. block on the pending decision
           timeout → return "ask"
@@ -93,6 +93,9 @@ Without a name, preymax falls back to `basename(cwd)` + git branch, then to
 | `preymax deny <id>` | Deny |
 | `preymax grants` | List active temporary grants |
 | `preymax stats [--hours N]` | Escalation rate, per-terminal volume, latency percentiles |
+| `preymax suggest [--apply]` | Mine the log for policy rules — see below |
+| `preymax shadow on\|off` | Log everything, decide nothing, stall nobody. The mode you measure in |
+| `preymax relay enable\|disable` | The notification layer. Off by default; when off it is never loaded |
 | `preymax doctor [--push]` | Verify the whole path end to end |
 
 `preymax pending` / `approve` / `deny` are the **local escape hatch** and work
@@ -121,6 +124,49 @@ for `~/.preymax/policy.yaml`.
 never reaches preymax at all.** The policy engine should only handle the
 genuinely ambiguous middle. If preymax is deciding on `Read` calls, the
 configuration is wrong.
+
+## `preymax suggest` — turning the log into policy
+
+Your own approval history is the only honest source of what you should stop
+being asked about. `suggest` mines it, scores each candidate, and can write the
+result into `policy.yaml` — backed up, annotated with the observation count, and
+revertable.
+
+```
+$ preymax suggest --hours 168
+Analyzed 193 escalations over 168h across 5 sessions.
+
+  Edit in ~/code/api/                 53 escalations  (27%)   review — writes, scoped to ~/code/api/
+  ^git\s+(status|diff)\b[^;&|><$`\n]*$ 22 escalations  (11%)   safe   — read-only
+  ^sed\b[^;&|><$`\n]*$                 4 escalations   (2%)   review — unrecognised command
+```
+
+Three rule forms come out of it: a Bash `command_matches` rule, a whole-tool
+rule, and a **path-scoped** rule for writers — the same tool restricted to a
+directory your log shows that session working in, since "allow `Edit`" has no
+smaller version and is never suggested.
+
+Three safety levels, and the boundary between them is the whole design:
+
+- **`safe`** — read-only or navigation, never denied, no secret ever in view.
+  `--apply` writes these.
+- **`review`** — plausible but it writes, networks, or runs project code. Never
+  written without `--apply --include-review`. Every path scope is capped here
+  no matter how often it repeats, because `safe` means "applied without reading
+  it" and authorizing writes is not that.
+- **`unsafe`** — denied at least once, touched something secret-shaped, or has
+  no form a rule could safely take. Never suggested at any level.
+
+Generated rules are safe *on their own*, because there is no deny bucket behind
+them. A Bash rule excludes `;`, `&`, `|`, `>`, `<`, `$` and backticks, so a
+suggestion for `echo` cannot become `echo SECRET=x > .env`. A path rule excludes
+any dotted segment below its scope, so `.git/hooks/pre-commit` and `.env` still
+escalate, and paths are normalized before matching so a prefix cannot be
+traversed out of.
+
+If `suggest` returns nothing, that is a finding rather than a failure: it means
+what interrupts you has no repeating shape a rule can name — most often chained
+or multi-line Bash, which nothing here can match by design.
 
 ## Phone approval
 

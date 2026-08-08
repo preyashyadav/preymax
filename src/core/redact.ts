@@ -85,6 +85,19 @@ export function collapseHome(s: string): string {
 }
 
 /**
+ * Inverse of `collapseHome`, for the one caller that needs it: the event log
+ * stores collapsed paths, and a policy rule is matched against the real one.
+ * Only a leading `~/` is expanded — a `~` further into a string is a character,
+ * not a home directory.
+ */
+export function expandHome(s: string): string {
+  const home = homedir();
+  if (!home || home === '/') return s;
+  if (s === '~') return home;
+  return s.startsWith('~/') ? home + s.slice(1) : s;
+}
+
+/**
  * Redact secrets from a free-text string. Safe to call on anything.
  */
 export function redactString(input: string): string {

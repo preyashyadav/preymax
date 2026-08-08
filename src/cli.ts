@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig } from './core/config.js';
+import { loadConfig, bindsTailnet } from './core/config.js';
 import { paths } from './core/paths.js';
 import { Daemon } from './daemon/server.js';
 import { UnsafeBindError } from './daemon/net.js';
@@ -116,7 +116,10 @@ async function runDaemon(): Promise<number> {
 
   console.log(`preymax daemon listening on ${handle.addresses.map((a) => `${a}:${cfg.port}`).join(', ')}`);
   if (handle.tailnet) console.log(`  tailnet: ${handle.tailnet}`);
-  else if (cfg.bindTailnet) console.log('  tailnet: not found — loopback only, phone approval unavailable');
+  else if (bindsTailnet(cfg))
+    console.log('  tailnet: not found — loopback only, phone approval unavailable');
+  else if (cfg.bindTailnet)
+    console.log('  tailnet: not bound — the relay is off, so nothing needs to reach us from it');
   console.log(`  events:  ${paths.events()}`);
   console.log(`  timeout: ${cfg.decisionTimeoutMs}ms, then falls through to the normal prompt`);
 
